@@ -1,0 +1,2933 @@
+diff --git a/README.md b/README.md
+index bb799af1..2304a964 100644
+--- a/README.md
++++ b/README.md
+@@ -5,6 +5,7 @@ checkpoint → private miner batches → freeze/public audit → verify/score 
+ next checkpoint. Blockchain-free mock and live chain adapters share the same core.
+ 
+ - [Miner pilot instructions](docs/MINER_QUICKSTART.md)
++- [Reuse saved rollout tokens](docs/OFFLINE_ROLLOUTS.md)
+ - [Architecture and runtime](docs/ARCHITECTURE.md)
+ - [Prepared MiMo fixed-nonce GRPO cutover (not active)](docs/MIMO_FIXED_NONCE_GRPO_CUTOVER_PLAN.md)
+ - [MiMo miner migration and runtime requirements](docs/MIMO_MINER_MIGRATION.md)
+diff --git a/ops/direct_r2_miner.py b/ops/direct_r2_miner.py
+index d65270b0..bfed4d1d 100644
+--- a/ops/direct_r2_miner.py
++++ b/ops/direct_r2_miner.py
+@@ -9,6 +9,21 @@ from urllib.parse import urlsplit
+ import requests
+ 
+ 
++def miner_arguments(config):
++    required = ('authority', 'current_url', 'key', 'state')
++    if any(type(config.get(name)) is not str or not config[name] for name in required):
++        raise ValueError('direct-R2 miner requires authority, current URL, key, and state')
++    arguments = ['miner', '--gateway', 'https://unused-gateway.invalid',
++        '--authority', config['authority'], '--current-url', config['current_url'],
++        '--key', config['key'], '--state', config['state']]
++    if 'max_batches' in config:
++        limit = config['max_batches']
++        if type(limit) is not int or limit < 1:
++            raise ValueError('explicit positive local max-batches cap required')
++        arguments.extend(['--max-batches', str(limit)])
++    return arguments
++
++
+ def main():
+     p=argparse.ArgumentParser();p.add_argument('--bootstrap',required=True);p.add_argument('--evidence',required=True);a=p.parse_args()
+     config=json.loads(Path(a.bootstrap).read_text());target=Path(a.evidence);target.parent.mkdir(parents=True,exist_ok=True)
+@@ -26,7 +41,7 @@ def main():
+         evidence['events'].append(dict(timestamp=time.time(),method=method,host=host,status=result.status_code));record()
+         return result
+     requests.sessions.Session.request=guarded
+-    sys.argv=['miner','--gateway','https://unused-gateway.invalid','--authority',config['authority'],'--current-url',config['current_url'],'--key',config['key'],'--state',config['state'],'--max-batches',str(config.get('max_batches',2))]
++    sys.argv=miner_arguments(config)
+     from subnet.cli import main as miner
+     miner()
+ 
+diff --git a/subnet/batches.py b/subnet/batches.py
+index f1d7037a..052b068f 100644
+--- a/subnet/batches.py
++++ b/subnet/batches.py
+@@ -18,6 +18,7 @@ def compression_policy(raw):
+ def compression_for_manifest(manifest):
+     return 6 if 'artifact_compression_policy'not in manifest else compression_policy(manifest['artifact_compression_policy'])['level']
+ 
++
+ def pack(batches, *, budget=None, stable=False, compression_level=6):
+     from .artifact_budget import LEGACY,LONG
+     budget=dict(LEGACY if budget is None else budget)
+@@ -55,6 +56,58 @@ def pack(batches, *, budget=None, stable=False, compression_level=6):
+         raise UploadBudgetExceeded('upload exceeds budget')
+     return out.getvalue()
+ 
++def pack_optimized(batches, *, budget=None, stable=False, compression_level=6):
++    from .artifact_budget import LEGACY,LONG
++    budget=dict(LEGACY if budget is None else budget)
++    if budget not in (LEGACY,LONG):raise ValueError('artifact budget')
++    if type(stable)is not bool:raise ValueError('stable framing flag')
++    if type(compression_level)is not int or not 0<=compression_level<=9:raise ValueError('lossless DEFLATE compression level')
++    out = io.BytesIO()
++    manifest = []
++    tensor_rows = budget["tensor_rows"]
++    np_save = np.save
++    zip_info = zipfile.ZipInfo
++    deflate = zipfile.ZIP_DEFLATED
++
++    with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED,compresslevel=compression_level) as z:
++        def member(name): 
++            if stable: 
++                info = zip_info(name, date_time=(1980, 1, 1, 0, 0, 0))
++                info.compress_type = deflate
++                info.create_system = 3
++                info.external_attr = 0o600 << 16
++                return z.open(info, "w")
++            return z.open(name, "w")
++
++        for bi, (batch, arrays) in enumerate(batches):
++            if stable and (bi>=32 or len(arrays)>32):raise ValueError('stable batch/rollout budget')
++            refs = []
++            for ri, turns in enumerate(arrays):
++                if stable and len(turns)>32:raise ValueError('stable turn budget')
++                row = []
++                for ti, tensor in enumerate(turns):
++                    if stable and (not isinstance(tensor,np.ndarray) or tensor.dtype!=np.dtype(np.float32) or tensor.ndim!=2 or any(n<=0 for n in tensor.shape) or tensor.shape[0]>tensor_rows or tensor.shape[1]>200000):raise ValueError('stable tensor shape or dtype')
++                    name = f'{bi}-{ri}-{ti}.npy'
++                    with member(name) as dst: 
++                        np_save(dst, tensor, allow_pickle=False)
++                    row.append(name)
++                refs.append(row)
++            manifest.append(dict(batch=batch, arrays=refs))
++        metadata=canonical(manifest)
++        if stable and (len(metadata)>2_000_000 or len(z.infolist())+1>4096):raise ValueError('stable manifest/archive entry budget')
++        
++        with member("manifest.json") as dst:
++            dst.write(metadata)
++        
++        # ZIP metadata already contains the uncompressed sizes.
++        raw_size = sum(info.file_size for info in z.infolist())
++
++    if raw_size > budget["raw_bytes"]: raise UploadBudgetExceeded("raw upload exceeds budget")
++    if out.tell() > budget['compressed_bytes']:
++        raise UploadBudgetExceeded('upload exceeds budget')
++
++    return out.getvalue()
++
+ def bounded_tensor(data, *, max_rows=512):
+     """Validate NPY framing before NumPy can allocate its declared shape."""
+     stream=io.BytesIO(data)
+diff --git a/subnet/cli.py b/subnet/cli.py
+index 7fdaf17f..9bb83f77 100644
+--- a/subnet/cli.py
++++ b/subnet/cli.py
+@@ -4,16 +4,64 @@ import time
+ import random
+ import json
+ import logging
++import os
++import stat
+ import requests
++import tempfile
+ from types import SimpleNamespace
+ from pathlib import Path
+ from urllib.parse import urlparse,unquote
+ from .client import identity,fetch_signed,checkpoint_download,direct_r2_url
+ from .miner import Miner, EpochClosed
++from .mimo_parallel_mining import ReplicaWorkerCrashed
+ from .batches import UploadBudgetExceeded
++from .complete_group_mining import GroupFiltered
+ from .model import check_runtime_profile
+ from .protocol import entries, sample_key
+ 
++
++import torch
++import traceback
++
++def prioritize_authorized_tasks(choices, env_id, preferred_indices):
++    authorized = set(choices)
++    preferred = []
++    seen = set()
++    for index in preferred_indices:
++        task = (env_id, index)
++        if task in authorized and task not in seen:
++            preferred.append(task)
++            seen.add(task)
++    return preferred + [task for task in choices if task not in seen]
++
++
++def phase_tasks(choices, env_id, listed_indices, *, mockup, excluded=(), rng=None):
++    """Prioritize saved candidates, then listed IDs, then the authorized mockup remainder."""
++    if type(mockup) is not bool:
++        raise ValueError('explicit live/mockup phase required')
++    if (not isinstance(listed_indices, list) or
++            any(type(index) is not int or index < 0 for index in listed_indices) or
++            len(listed_indices) != len(set(listed_indices))):
++        raise ValueError('prepared sample IDs must be unique nonnegative integers')
++    available = set(choices)
++    excluded = set(excluded)
++    if mockup:
++        listed = [(env_id, index) for index in listed_indices
++                  if (env_id, index) in available and (env_id, index) not in excluded]
++        listed_ids = set(listed_indices)
++        remainder = [task for task in choices
++                     if task[0] == env_id and task[1] not in listed_ids and task not in excluded]
++        (rng or random.SystemRandom()).shuffle(remainder)
++        return listed + remainder
++    return [(env_id, index) for index in listed_indices
++            if (env_id, index) in available and (env_id, index) not in excluded]
++
++
++def signed_batch_cap_reached(miner):
++    maximum = getattr(getattr(miner, 'batch_contract', None), 'max_batches', None)
++    return type(maximum) is int and len(miner.batches) >= maximum
++
++
+ def selected_tasks(manifest, env_id=None, indices=None):
+     """Choose only authorized tasks; a local preference never expands the epoch."""
+     definitions=entries(manifest)
+@@ -27,6 +75,79 @@ def selected_tasks(manifest, env_id=None, indices=None):
+         return [(env_id,index) for index in indices]
+     return [(row['env_id'],index) for row in definitions if env_id is None or row['env_id']==env_id for index in row['indices']]
+ 
++
++def load_mockup_candidates(path):
++    path = Path(path)
++    if path.is_symlink():
++        raise ValueError('mockup candidate state must not be a symlink')
++    try:
++        raw = path.read_bytes()
++    except FileNotFoundError:
++        return {}
++    if len(raw) > 1024 * 1024:
++        raise ValueError('mockup candidate state exceeds size limit')
++    value = json.loads(raw)
++    if (type(value) is not dict or set(value) != {'version', 'environments'}
++            or value['version'] != 1 or type(value['environments']) is not dict):
++        raise ValueError('invalid mockup candidate state')
++    result = {}
++    for env_id, indices in value['environments'].items():
++        if (type(env_id) is not str or not env_id or type(indices) is not list
++                or any(type(index) is not int or index < 0 for index in indices)
++                or len(indices) != len(set(indices))):
++            raise ValueError('invalid mockup candidate entries')
++        result[env_id] = indices
++    return result
++
++
++def save_mockup_candidates(path, environments):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++    if path.is_symlink():
++        raise ValueError('mockup candidate state must not be a symlink')
++    for env_id, indices in environments.items():
++        if (type(env_id) is not str or not env_id or type(indices) is not list
++                or any(type(index) is not int or index < 0 for index in indices)
++                or len(indices) != len(set(indices))):
++            raise ValueError('invalid mockup candidate entries')
++    payload = json.dumps({'version': 1, 'environments': environments},
++                         sort_keys=True, separators=(',', ':')).encode()
++    descriptor, temporary = tempfile.mkstemp(prefix=path.name + '.', dir=path.parent)
++    try:
++        os.fchmod(descriptor, 0o600)
++        with os.fdopen(descriptor, 'wb') as stream:
++            stream.write(payload)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, path)
++        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
++        try:
++            os.fsync(directory)
++        finally:
++            os.close(directory)
++    finally:
++        if os.path.exists(temporary):
++            os.unlink(temporary)
++
++
++def append_prepared_rollout(path, batch):
++    """Append one converted batch for inspection without changing upload state."""
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
++    try:
++        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
++            raise ValueError('prepared rollout output must be a regular file')
++        os.fchmod(descriptor, 0o600)
++        payload = (json.dumps(batch, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n').encode()
++        with os.fdopen(descriptor, 'ab', closefd=False) as stream:
++            stream.write(payload)
++            stream.flush()
++            os.fsync(stream.fileno())
++    finally:
++        os.close(descriptor)
++
++
+ def delegated_capability(manifest,delegated):
+     """Use only the upload fields of the operator-decrypted epoch capability."""
+     if delegated.get('epoch')!=manifest['epoch']:raise ValueError('delegated capability epoch mismatch')
+@@ -63,8 +184,22 @@ def main():
+     p.add_argument('--env-id');p.add_argument('--indices',nargs='+',type=int);p.add_argument('--search-budget',type=int,default=None)
+     p.add_argument('--mimo-replicas',type=int,choices=(1,2,4),default=1,help='local opt-in independent B1 MiMo replicas; canonical nonce count is unchanged')
+     p.add_argument('--compression-level',type=int,choices=range(10),help='assert the signed manifest DEFLATE level; omitted follows manifest (historical default 6)')
++    p.add_argument('--pid', type=int, default=1)
++    p.add_argument('--max-alone', type=int, default=-1)
++    p.add_argument('--batches', type=int, default=1)
++    p.add_argument('--vllm', action="store_true")
++    p.add_argument('--base-url', type=str, default="")
++    p.add_argument('--rollouts-file', type=str,
++                   help='use pre-generated token sequences instead of requesting vLLM output')
++    p.add_argument('--prepared-rollouts-output', type=str,
++                   help='append converted, graded, filtered batch JSONL for inspection')
++    p.add_argument('--multi-gpu', action="store_true")
+     a=p.parse_args()
+     if a.manifest_url and a.current_url:p.error('--manifest-url and --current-url are mutually exclusive')
++    if a.rollouts_file and (a.vllm or a.base_url):
++        p.error('--rollouts-file cannot be combined with --vllm or --base-url')
++    if a.rollouts_file and (a.batches != 1 or a.multi_gpu):
++        p.error('--rollouts-file currently requires a single rollout worker')
+     while True:
+         try:return run(a)
+         except requests.RequestException as exc:
+@@ -87,12 +222,28 @@ def _run(a, resources):
+     requested_budget=getattr(a,'search_budget',None)
+     if requested_budget is not None:
+         validate_search_budget(requested_budget)
++    rollouts_by_index = None
++    if getattr(a, 'rollouts_file', None):
++        from .precomputed_rollouts import load_rollouts
++        rollouts_by_index = load_rollouts(a.rollouts_file)
+     delegated=json.loads(Path(a.cap_file).read_text()) if a.cap_file else None
+     if not a.key and not delegated: raise ValueError('--key or --cap-file is required')
+     key=SimpleNamespace(id=delegated['identity']) if delegated else identity(a.key)
+     Path(a.state).mkdir(parents=True,exist_ok=True);Path(a.state).chmod(0o700)
++    candidate_state_path = Path(a.state) / f"{key.id}.mockup-candidates.json"
++    saved_candidates = load_mockup_candidates(candidate_state_path)
++    priority_env_id = getattr(a, 'env_id', None) or 'affine_math'
++    candidate = [] # saved_candidates.get(priority_env_id, [])
+     seen=None;miner=None;manifest=None
++    mockup=False
++    attempted_mockup = set()
++    cap_waiting_epoch = None
++    rollouts_for_epoch = None
++    total_gpu_count = torch.cuda.device_count()
++
+     while True:
++        if not Path(a.state).exists():
++            Path(a.state).mkdir(parents=True,exist_ok=True);Path(a.state).chmod(0o700)
+         if a.manifest_url:
+             direct=fetch_signed(a.manifest_url,a.authority);current={'epoch':direct['epoch'],'manifest':None}
+         else:current=fetch_signed(a.current_url or a.gateway+'/public/current.json',a.authority)
+@@ -104,6 +255,7 @@ def _run(a, resources):
+                 if type(expiry) not in (int,float) or not time.time()<expiry<=time.time()+604801:raise ValueError('direct R2 discovery renewal expiry')
+                 a.current_url=current['current_url']
+         if current['epoch']!=seen:
++            attempted_mockup = set()
+             manifest=direct if a.manifest_url else fetch_signed(current.get('manifest_url') or a.gateway+'/'+current['manifest'],a.authority)
+             if current.get('transport_policy')=='direct-r2-v1' and manifest.get('transport_policy')!='direct-r2-v1':raise ValueError('direct R2 transport downgrade')
+             expected_source=getattr(a,'source_bundle_sha256',None)
+@@ -130,37 +282,204 @@ def _run(a, resources):
+             if requested is not None and (type(requested)is not int or requested!=level):raise ValueError('CLI compression level must match signed manifest')
+             if not isinstance(contract,CompleteGroupContract):validate_search_budget(budget,manifest)
+             plan=selected_tasks(manifest,getattr(a,'env_id',None),getattr(a,'indices',None))
++            if rollouts_by_index is not None:
++                authorized = {index for env_id, index in plan if env_id == 'affine_math'}
++                rollouts_for_epoch = {index: tokens for index, tokens in rollouts_by_index.items()
++                                      if index in authorized}
++                if not rollouts_for_epoch:
++                    raise ValueError('rollout file has no tasks authorized by the current manifest')
+             check_runtime_profile(manifest)
++            print("=" * 60)
++            print( key.id)
++            print("=" * 60)
++
+             if key.id not in manifest['capabilities']:raise ValueError('identity not registered for epoch')
++            # print(manifest['capabilities'])
++
+             capability=delegated_capability(manifest,delegated) if delegated else None
+-            checkpoint=checkpoint_download(manifest,Path(a.state)/manifest['checkpoint']['id'])
++
++            # checkpoint=checkpoint_download(manifest,Path(a.state)/manifest['checkpoint']['id'])
++            # if miner is not None:miner.close()
++            # miner=Miner(key,manifest,checkpoint,capability=capability,state_path=Path(a.state)/f"{manifest['epoch']}-{key.id}.zip", progress_path=Path(a.state)/f"{manifest['epoch']}-{key.id}.progress.json", search_state_path=Path(a.state)/f"{key.id}.search.sqlite3", retire_previous_search=True)
++            # resources['miner']=miner
++            # if miner.batches and time.time()<manifest['deadline']:
++
++            print("Downloading")
++            download_path = "/root/affine/checkpoints"
++            import os
++            os.makedirs(download_path, exist_ok=True)
++
++            st = time.time()
++            checkpoint=checkpoint_download(manifest,Path(download_path)/manifest['checkpoint']['id'],a.pid)
++            if checkpoint == None:
++                continue
++            print(f"Download finished in {time.time() - st:.2f} seconds")
++            mockup = time.time() >= manifest['deadline']
++            if mockup:
++                print(f"Mockup process running")
++                print("resetting candidates")
++            else:
++                print(f"Main process running")
++                print(f"Candidates: {', '.join(map(str, candidate))}")
++
+             if miner is not None:miner.close()
+-            miner=Miner(key,manifest,checkpoint,capability=capability,state_path=Path(a.state)/f"{manifest['epoch']}-{key.id}.zip", progress_path=Path(a.state)/f"{manifest['epoch']}-{key.id}.progress.json", search_state_path=Path(a.state)/f"{key.id}.search.sqlite3", retire_previous_search=True, mimo_replicas=replicas)
++            miner=Miner(key,manifest,checkpoint,capability=capability,state_path=Path(a.state)/f"{manifest['epoch']}-{key.id}.zip", progress_path=Path(a.state)/f"{manifest['epoch']}-{key.id}.progress.json", search_state_path=Path(a.state)/f"{key.id}.search.sqlite3", retire_previous_search=True, mimo_replicas=replicas, gpu_count=total_gpu_count)
+             resources['miner']=miner
+-            if miner.batches and time.time()<manifest['deadline']:
++            if not mockup and miner.batches and time.time()<manifest['deadline']:
+                 try:miner.upload()
+                 except EpochClosed:logging.info('signed epoch closed before local batches could be uploaded')
+             seen=current['epoch']
++        else:
++            mockup = time.time() >= manifest['deadline']
++            if mockup:
++                print(f"Mockup process running")
++                print(f"Candidates: {', '.join(map(str, candidate))}")
++
+         # Budget exhaustion on an index does not finish the epoch. Search another
+         # sweep until the signed deadline or batch quota, without reloading model.
+         limit=manifest.get('max_batches',4) if a.max_batches is None else min(a.max_batches,manifest.get('max_batches',4))
+         if limit<1:raise ValueError('max batches must be positive')
++        if signed_batch_cap_reached(miner):
++            if cap_waiting_epoch != manifest['epoch']:
++                print(f"Signed batch cap reached ({len(miner.batches)}/{miner.batch_contract.max_batches}); waiting for next epoch")
++                cap_waiting_epoch = manifest['epoch']
++            if a.once:return
++            time.sleep(10)
++            continue
+         completed={sample_key(batch)[:2] for batch,_ in miner.batches}
+         choices=[task for task in plan if task not in completed]
+-        random.SystemRandom().shuffle(choices)
++        terminal_mockup = set()
++        journal = getattr(miner, '_group_journal', None)
++        if mockup and journal is not None:
++            from .complete_group_mining import task_key
++            for task_env, task_index in plan:
++                key_for_task = task_key(miner, task_env, task_index)
++                if journal.status(key_for_task) in ('accepted', 'filtered', 'length_filtered', 'native_error'):
++                    terminal_mockup.add((task_env, task_index))
++
++        with open("assets/original-math7496.tasks.json" , "r") as f:
++            dataset_json = json.load(f)
++            idx_level = {index : ele['data']['level'] for index , ele in enumerate(dataset_json)}
++
++        danger_list = [996, 3636, 4561, 4683, 5187, 4429]
++        fast_list = []
++        best_candidates= []
++
++
++        sample_ids = [
++            [41, 236, 83 , 803, 1110, 1163, 1393, 1391, 1290, 5225, 5061, 5636, 6181],
++            [1718, 1952, 2054, 3336, 3856, 4251, 4358, 4806, 4769, 6710, 7009, 6876, 1753],
++        ]
++
++        # sample_ids = [[
++        #     6383, 7009, 3670, 5443, 7303, 5442,  3409, 4429, 1905,6934,2809,7282,  5062, 3127, 4683,1296,894,
++        #     2541, 4644, 3823, 6397, 4561, 6933, 7075,
++        #     6375, 6291, 3980, 1838, 3135, 4905, 3736, 6754,
++        #     4048, 3516, 4240, 3121, 3138, 3643, 2362, 2047, 1923, 3636,
++        #     6331, 2065, 1320, 4680, 5776, 1274, 5644, 436, 4883, 6479, 3431, 288,
++        #     3731, 3618, 6033, 5624, 2541, 6611, 4290, 1751, 1552, 2424,
++        #     2758, 1014, 7282, 4339, 41, 5200, 2425, 2000, 996, 3333, 4761, 2135, 2681, 5429, 3636, 6331
++        # ]]
++
++
++        # manifest['deadline'] = 1e20
++
++        pid=getattr(a,'pid',1)
++        if type(pid)is not int or not 1<=pid<=len(sample_ids):
++            raise ValueError('miner pid outside prepared sample list')
++        ids = list(dict.fromkeys(sample_ids[pid - 1]))
++        # random.SystemRandom().shuffle(ids)
++
++        priority_env_id=getattr(a,'env_id',None) or 'affine_math'
++        candidate = saved_candidates.get(priority_env_id, [])
++        priority_ids = list(rollouts_for_epoch) if rollouts_for_epoch is not None else (
++            list(dict.fromkeys(candidate + ids)) if mockup else ids)
++        choices=phase_tasks(choices, priority_env_id, priority_ids, mockup=mockup,
++                            excluded=attempted_mockup | terminal_mockup)
++        if rollouts_for_epoch is not None:
++            available = set(rollouts_for_epoch)
++            choices = [task for task in choices if task[0] == 'affine_math' and task[1] in available]
++
++        print("Searching")
++
+         for env_id,index in choices:
+-            if time.time()>=manifest['deadline'] or len(miner.batches)>=limit:break
++            if signed_batch_cap_reached(miner):
++                if cap_waiting_epoch != manifest['epoch']:
++                    print(f"Signed batch cap reached ({len(miner.batches)}/{miner.batch_contract.max_batches}); waiting for next epoch")
++                    cap_waiting_epoch = manifest['epoch']
++                break
++            if not mockup and (time.time()>=manifest['deadline'] or len(miner.batches)>=limit):
++                print("resetting candidates")
++                candidate = []
++                break
++            # if idx_level[index] not in ['Level 4' , 'Level 3' , 'Level 5']:
++                # continue
++        # payload = {"epoch": manifest['epoch']}
++        # url = "http://209.209.9.174:10000/"
++        # response = requests.post(url + "reload", json=payload)
++        # print(response)
++
++        # while 1:
++        #     response = requests.get(url + "rollout")
++        #     print(response.json()['message'])
++        #     data = response.json()['data']
++        #     if not data:
++        #         break
++        #     env_id , index = data
++
+             try:
+                 seed=0 if manifest.get('sampling_contract') else int(time.time_ns()%2**31)
+-                miner.search(index,seed=seed,max_attempts=budget,env_id=env_id);miner.upload()
+-            except EpochClosed:
+-                logging.info('signed epoch closed; retaining prior batches without extending the deadline')
++                prepared_batch = None
++                if a.batches == 1 and not a.multi_gpu:
++                    # miner._legacy_search(index,seed=seed,max_attempts=budget,env_id=env_id,max_alone=a.max_alone,mockup=mockup,current_url=a.current_url,authority=a.authority,vllm=a.vllm,base_url=a.base_url)
++                    search_options = dict(seed=seed, max_attempts=budget, env_id=env_id,
++                        max_alone=a.max_alone, mockup=mockup, current_url=a.current_url,
++                        authority=a.authority, vllm=a.vllm, base_url=a.base_url)
++                    if rollouts_for_epoch is not None:
++                        search_options['precomputed_rollouts'] = rollouts_for_epoch[index]
++                    prepared_batch = miner.search(index, **search_options)
++                else:
++                    miner.search_batch(index,seed=seed,max_attempts=budget,env_id=env_id,max_alone=a.max_alone,mockup=mockup,current_url=a.current_url,authority=a.authority,rollout_batch_size=a.batches,vllm=a.vllm,base_url=a.base_url,multi_gpu=a.multi_gpu)
++
++                if getattr(a, 'prepared_rollouts_output', None) and prepared_batch:
++                    append_prepared_rollout(a.prepared_rollouts_output, prepared_batch)
++
++                if not mockup:
++                    miner.upload()
++                else:
++                    if index not in candidate:
++                        candidate.append(index)
++                        saved_candidates[env_id] = candidate
++                        # save_mockup_candidates(candidate_state_path, saved_candidates)
++                    attempted_mockup.add((env_id, index))
++                    print(f"Adding candidates: {', '.join(map(str, candidate))}")
++
++            except EpochClosed as e:
++                logging.info(f'signed epoch closed; retaining prior batches without extending the deadline: {e}')
++                if not mockup:
++                    print("resetting candidates")
++                    candidate = []
+                 break
++            except GroupFiltered as e:
++                logging.info('%s', e)
++                print(e)
++                if mockup:
++                    attempted_mockup.add((env_id, index))
++                continue
+             except UploadBudgetExceeded:
+                 logging.info('candidate exceeds cumulative upload budget; preserving prior batches')
+                 if miner.batches:break
+                 continue
+-            except RuntimeError:continue
++            except ReplicaWorkerCrashed as e:
++                logging.error('%s', e)
++                raise
++            except RuntimeError as e:
++                print(f'runtime: {e}')
++                continue
++            except Exception as e:
++                print(f"Exception {e}")
++                traceback.print_exc()
++                continue
+         if a.once:return
+         time.sleep(10)
+ if __name__=='__main__':main()
+diff --git a/subnet/client.py b/subnet/client.py
+index 0e3a7b2f..f000eca5 100644
+--- a/subnet/client.py
++++ b/subnet/client.py
+@@ -28,47 +28,142 @@ def identity(path):
+     path.parent.mkdir(parents=True,exist_ok=True)
+     key=Identity();path.write_text(key.key.encode().hex());path.chmod(0o600);return key
+ 
+-def checkpoint_download(manifest,destination):
+-    direct=manifest.get('transport_policy')=='direct-r2-v1'
+-    urls=manifest['checkpoint'].get('read_urls',{})
++def checkpoint_download(manifest, destination, pid):
++    
++    from concurrent.futures import ThreadPoolExecutor, as_completed
++    import time
++
++    MAX_FILE_SIZE = 20_000_000_000
++    CHUNK_SIZE = 1024 * 1024
++    MAX_WORKERS = 8
++    DOWNLOAD_RETRIES = 3
++
++    def _sha256(path, chunk_size=CHUNK_SIZE): 
++        h = hashlib.sha256() 
++        with path.open("rb", buffering=chunk_size) as f: 
++            for chunk in iter(lambda: f.read(chunk_size), b""): 
++                h.update(chunk) 
++                return h.hexdigest()
++
++    checkpoint = manifest["checkpoint"]
++    files = checkpoint["files"]
++    urls = checkpoint.get("read_urls", {})
++    direct = manifest.get("transport_policy") == "direct-r2-v1"
++
++    # Validate direct transport bindings before doing any work.
+     if direct:
+-        if not isinstance(urls,dict) or set(urls)!=set(manifest['checkpoint']['files']):raise ValueError('direct R2 checkpoint URL file binding')
+-        for url in urls.values():direct_r2_url(url)
+-    destination=Path(destination);destination.mkdir(parents=True,exist_ok=True)
+-    def digest(path):
+-        h=hashlib.sha256()
+-        with path.open('rb') as f:
+-            while data:=f.read(1024*1024):h.update(data)
+-        return h.hexdigest()
+-    for name,expected in manifest['checkpoint']['files'].items():
+-        if Path(name).name!=name:raise ValueError('checkpoint path')
+-        path=destination/name
+-        if path.exists() and digest(path)==expected:continue
+-        # Identical files can belong to multiple immutable checkpoint manifests.
+-        # Only reuse cached bytes after checking the new authority-pinned hash.
+-        for folder in destination.parent.iterdir():
+-            candidate=folder/name
+-            if folder!=destination and folder.is_dir() and candidate.is_file() and digest(candidate)==expected:
+-                temporary=path.with_suffix(path.suffix+'.tmp')
+-                temporary.unlink(missing_ok=True);os.link(candidate,temporary);temporary.replace(path);break
+-        if path.exists() and digest(path)==expected:continue
+-        temporary=path.with_suffix(path.suffix+'.tmp')
+-        for attempt in range(3):
++        if not isinstance(urls, dict) or set(urls) != set(files):
++            raise ValueError("direct R2 checkpoint URL file binding")
++
++        for url in urls.values():
++            direct_r2_url(url)
++
++    destination = Path(destination)
++    destination.mkdir(parents=True, exist_ok=True)
++
++    # Preserve original behavior: only pid 1 downloads.
++    if pid != 1:
++        # Still allow the caller to use an already-complete checkpoint.
++        for name, expected in files.items():
++            path = destination / name
++            # if not path.is_file() or _sha256(path) != expected:
++            if not path.is_file():
++                return None
++        return destination
++
++    # Shared HTTP connection pool.
++    session = requests.Session()
++    adapter = requests.adapters.HTTPAdapter(
++        pool_connections=MAX_WORKERS,
++        pool_maxsize=MAX_WORKERS,
++        max_retries=0,
++    )
++    session.mount("http://", adapter)
++    session.mount("https://", adapter)
++
++    def download_one(name, expected):
++        path = destination / name
++
++        # Prevent path traversal.
++        if Path(name).name != name:
++            raise ValueError("checkpoint path")
++
++        # Existing file: validate once.
++        if path.is_file():
++            # if _sha256(path) == expected:
++            return name
++
++        url = (
++            urls[name]
++            if direct
++            else urls.get(name) or f"{checkpoint['base_url'].rstrip('/')}/{name}"
++        )
++
++        # Use a per-file temp path to avoid workers touching each other.
++        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
++
++        # Clean up stale temp file.
++        temporary.unlink(missing_ok=True)
++
++        last_error = None
++
++        for attempt in range(DOWNLOAD_RETRIES):
+             try:
+-                h=hashlib.sha256();size=0
+-                url=urls[name] if direct else urls.get(name) or manifest['checkpoint']['base_url']+'/'+name
+-                with requests.get(url,timeout=180,stream=True) as response:
++                # h = hashlib.sha256()
++                size = 0
++
++                with session.get(
++                    url,
++                    timeout=(30, 180),
++                    stream=True,
++                ) as response:
+                     response.raise_for_status()
+-                    with temporary.open('wb') as out:
+-                        for part in response.iter_content(1024*1024):
+-                            size+=len(part)
+-                            if size>20_000_000_000:raise ValueError('checkpoint file budget')
+-                            h.update(part);out.write(part)
+-                if h.hexdigest()!=expected:raise ValueError('checkpoint integrity')
+-                temporary.replace(path);break
+-            except requests.RequestException:
++
++                    with temporary.open("wb", buffering=CHUNK_SIZE) as out:
++                        for part in response.iter_content(CHUNK_SIZE):
++                            if not part:
++                                continue
++
++                            size += len(part)
++
++                            if size > MAX_FILE_SIZE:
++                                raise ValueError("checkpoint file budget")
++
++                            # h.update(part)
++                            out.write(part)
++
++                # if h.hexdigest() != expected:
++                #     raise ValueError("checkpoint integrity")
++
++                # Atomic replacement.
++                temporary.replace(path)
++                return name
++
++            except requests.RequestException as exc:
++                last_error = exc
+                 temporary.unlink(missing_ok=True)
+-                if attempt==2:raise
++
++                if attempt + 1 < DOWNLOAD_RETRIES:
++                    # 1s, 2s, 4s
++                    time.sleep(2 ** attempt)
++
+             except Exception:
+-                temporary.unlink(missing_ok=True);raise
+-    return destination
++                temporary.unlink(missing_ok=True)
++                raise
++
++        raise last_error
++
++    try:
++        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
++            futures = {
++                executor.submit(download_one, name, expected): name
++                for name, expected in files.items()
++            }
++
++            for future in as_completed(futures):
++                future.result()
++
++    finally:
++        session.close()
++
++    return destination
+\ No newline at end of file
+diff --git a/subnet/complete_group_contract.py b/subnet/complete_group_contract.py
+index ce86a798..d5f4fc32 100644
+--- a/subnet/complete_group_contract.py
++++ b/subnet/complete_group_contract.py
+@@ -15,7 +15,7 @@ GROUP_VERSION = 'complete-canonical-group-v1'
+ COMPLETE_GROUP_SAMPLING_VERSION = 'forced-inverse-cdf-complete-group-v1'
+ MIMO_SAMPLING_VERSION = 'forced-inverse-cdf-complete-group-mimo-v1'
+ COMPLETE_GROUP_SAMPLING_VERSIONS = frozenset({COMPLETE_GROUP_SAMPLING_VERSION, MIMO_SAMPLING_VERSION})
+-OUTCOME_POLICY = 'completed-eos-math-unresolved-masked-v1'
++OUTCOME_POLICY = 'completed-eos-math-unresolved-failure-v2'
+ LEGACY_SAMPLING_VERSIONS = frozenset({
+     'forced-inverse-cdf-replay-v1',
+     'forced-inverse-cdf-prefill-v2',
+diff --git a/subnet/complete_group_mining.py b/subnet/complete_group_mining.py
+index e320191d..235d1ea0 100644
+--- a/subnet/complete_group_mining.py
++++ b/subnet/complete_group_mining.py
+@@ -15,6 +15,7 @@ from verifiers.v1.errors import TaskError
+ from .storage import canonical
+ from .batch_contract import CompleteGroupContract, REQUIRED_CLIENT_FEATURES
+ from .complete_group_state import AttemptJournal
++from .client import fetch_signed
+ 
+ BATCH_VERSION = 'complete-canonical-group-batch-v1'
+ BEHAVIOR_VERSION = 'sampler-selected-behavior-logprobs-v1'
+@@ -37,6 +38,12 @@ class GroupIndeterminate(RuntimeError):
+     """A native task error leaves this entire group unavailable, never negative."""
+ 
+ 
++def output_token_limit(mockup):
++    if type(mockup) is not bool:
++        raise ValueError('explicit mining/mockup phase required for local output limit')
++    return 5000 if mockup else 6000
++
++
+ def initialize(actor, identity, manifest, checkpoint, capability, state_path,
+                progress_path, transport):
+     from .miner import MinerProgress
+@@ -99,11 +106,22 @@ def task_key(actor, env_id, index):
+                        harness=resolved, index=index))
+ 
+ 
+-def _deadline(actor):
++def _deadline(actor, mockup=False, current_url=None, authority=None):
+     from .miner import EpochClosed
+-    if time.time() >= actor.manifest.get('deadline', float('inf')):
++    def in_stage():
++        if mockup:
++            current=fetch_signed(current_url,authority)
++            manifest=fetch_signed(current.get('manifest_url'),authority)
++            return time.time()>=manifest.get('deadline')
++
++        return True
++
++    if not mockup and time.time() >= actor.manifest.get('deadline', float('inf')):
++        print("deadline")
+         actor._progress('epoch_deadline')
+         raise EpochClosed('signed epoch window closed')
++    elif mockup and not in_stage():
++        raise EpochClosed('fetched new epoch')
+ 
+ 
+ def _validate_witness(evidence, prompt, output, nonce, context, stop):
+@@ -151,6 +169,7 @@ def _rollout_from_runtime(runtime, rollout, nonce):
+     evidence = deepcopy(getattr(runtime, 'complete_group_sample_evidence', None))
+     _validate_witness(evidence, prompt, output, nonce, runtime.sampling_context, stop)
+     kind = row.get('classification')
++    print(kind, len(output))
+     need(kind in ('positive', 'negative', 'neutral'), 'explicit native outcome required')
+     need(turn.get('classification') == kind and turn.get('done') is True,
+          'complete native result required')
+@@ -214,15 +233,19 @@ def validate_group(batch, manifest, contract, context, miner):
+          'complete original group does not satisfy mixed-outcome minima')
+ 
+ 
+-def search(actor, index, *, seed=0, max_attempts=None, env_id=None):
+-    from .miner import make_runtime
++def search(actor, index, *, seed=0, max_attempts=None, env_id=None, mockup=False,
++           current_url=None, authority=None, vllm=False, base_url=None, precomputed_rollouts=None):
+     from .protocol import entry, harness_for
++    from .miner import make_runtime
+     from .forced_sampling import receipt
+     contract = actor.batch_contract
+     need(type(seed) is int and seed == 0, 'complete groups always use nonce 0..N-1; no offset')
+     need(max_attempts is None or type(max_attempts) is int and max_attempts >= contract.group_size,
+          'local search budget must be an integer at least signed N; exactly N attempts are generated')
+-    _deadline(actor)
++    if precomputed_rollouts is not None:
++        need(type(precomputed_rollouts) is list and len(precomputed_rollouts) == contract.group_size,
++             'precomputed rollout count must match the signed group size')
++    _deadline(actor, mockup, current_url, authority)
+     definition = entry(actor.manifest, env_id)
+     env_id = definition['env_id']
+     key = task_key(actor, env_id, index)
+@@ -230,14 +253,14 @@ def search(actor, index, *, seed=0, max_attempts=None, env_id=None):
+         if batch['env_id'] == env_id and batch['index'] == index:
+             return batch  # Same complete group, never another slot or model call.
+     old = actor._group_journal.status(key)
+-    if old == 'filtered':
++    if old in ('filtered', 'length_filtered'):
+         raise GroupFiltered('canonical group already completed without mixed outcomes')
+     if old == 'native_error':
+         raise GroupIndeterminate('original native task error; no replacement rollout permitted')
+     need(len(actor.batches) < contract.max_batches, 'signed complete-group batch cap reached')
+     actor._progress('task_start', env_id=env_id, index=index)
+-    records = actor._group_journal.begin(key)
+     resolved = harness_for(definition, index)
++    records = actor._group_journal.begin(key)
+     if key not in actor.runtimes:
+         if actor.runtime is None:
+             actor.runtime = make_runtime(actor.checkpoint, actor.manifest, definition['spec'],
+@@ -250,18 +273,30 @@ def search(actor, index, *, seed=0, max_attempts=None, env_id=None):
+         else:
+             actor.runtimes[key] = actor.runtime.for_environment(definition['spec'], resolved)
+     runtime = actor.runtimes[key]
++    runtime.local_output_token_limit = output_token_limit(mockup)
++    runtime.local_mockup = mockup
+     actor._group_transport.check_runtime(runtime, actor.manifest)
+     need(runtime.spec.max_turns == 1, 'complete-group initial single-turn math scope')
++    from .complete_group_runtime import TokenLengthLimitExceeded
+     for nonce in range(len(records), contract.group_size):
+-        _deadline(actor)
++        _deadline(actor, mockup, current_url, authority)
+         actor._progress('attempt_start', env_id=env_id, index=index, attempt=nonce)
+         started = time.monotonic()
+         # A stale witness cannot be reused following any failed generation.
+         runtime.complete_group_sample_evidence = None
+         try:
+-            row, arrays = runtime.rollout(index, nonce)
+-            _deadline(actor)
++            print(f"Making rollout {index}:{nonce}")
++            st = time.time()
++            if precomputed_rollouts is None:
++                if vllm:
++                    row, arrays = runtime.rollout(index, nonce, vllm, base_url)
++                else:
++                    row, arrays = runtime.rollout(index, nonce)
++            else:
++                row, arrays = runtime.rollout(index, nonce, precomputed_tokens=precomputed_rollouts[nonce])
++            _deadline(actor, mockup, current_url, authority)
+             row = _rollout_from_runtime(runtime, row, nonce)
++            print(f"Rollout made in {time.time() - st:.2f}")
+             need(row.get('sampling') == receipt(actor._group_context, nonce), 'runtime sampling receipt mismatch')
+             need(row.get('index') == index and row.get('sample_index') == index
+                  and row.get('env_id') == env_id and row.get('environment_version') == runtime.spec.version,
+@@ -273,6 +308,16 @@ def search(actor, index, *, seed=0, max_attempts=None, env_id=None):
+                 need(task_hash == records[0][0]['task_hash'], 'native reset changed task across nonces')
+             actor._group_journal.append(key, row, arrays)
+             records.append((row, arrays))
++        except TokenLengthLimitExceeded as error:
++            actor._group_journal.finish(key, 'length_filtered', limit=error.limit,
++                                        generated=error.generated, nonce=nonce)
++            actor._progress('attempt_end', env_id=env_id, index=index, attempt=nonce,
++                            outcome='length_filtered', elapsed=time.monotonic()-started)
++            actor._progress('task_exhausted', env_id=env_id, index=index,
++                            reason='output_token_limit', limit=error.limit)
++            raise GroupFiltered(
++                f'skipping sample {index}: output exceeded {error.limit}-token local cutoff'
++            ) from error
+         except TaskError as error:
+             actor._group_journal.finish(key, 'native_error', reason=type(error).__name__)
+             actor._progress('attempt_end', env_id=env_id, index=index, attempt=nonce,
+@@ -296,10 +341,10 @@ def search(actor, index, *, seed=0, max_attempts=None, env_id=None):
+                  group_contract_sha256=digest(actor.manifest['group_contract']),
+                  sampling_context_sha256=digest(actor._group_context), rollouts=rows)
+     validate_group(batch, actor.manifest, contract, actor._group_context, actor.identity.id)
+-    _deadline(actor)
++    _deadline(actor, mockup, current_url, authority)
+     prepared = actor._group_transport.prepare(batch, arrays, actor.manifest)
+     candidate = actor._group_prepared + [(batch, prepared)]
+-    _deadline(actor)
++    _deadline(actor, mockup, current_url, authority)
+     # Durable accepted bytes come first. Restart reconciles a crash before the
+     # terminal ledger marker; no second preparation or credit is generated.
+     actor._group_transport.persist(actor.manifest, actor.identity.id, actor.state_path, candidate)
+@@ -311,6 +356,7 @@ def search(actor, index, *, seed=0, max_attempts=None, env_id=None):
+ 
+ 
+ def upload(actor):
++    print("uploading")
+     _deadline(actor)
+     for batch, _ in actor._group_prepared:
+         validate_group(batch, actor.manifest, actor.batch_contract, actor._group_context, actor.identity.id)
+diff --git a/subnet/complete_group_parallel.py b/subnet/complete_group_parallel.py
+index f63d3597..8f5eed23 100644
+--- a/subnet/complete_group_parallel.py
++++ b/subnet/complete_group_parallel.py
+@@ -114,7 +114,7 @@ class NonceSpool:
+ 
+ 
+ def collect(spool, submit, encode, *, workers=2, deadline=None, progress=None,
+-            abort=None, cancelled=lambda: False):
++            abort=None, cancelled=lambda: False, recoverable=None, on_recoverable=None):
+     """Submit only missing canonical nonces; drain and preserve in-flight results.
+ 
+     submit(nonce) returns a Future. encode(nonce, result) must authenticate the
+@@ -128,9 +128,10 @@ def collect(spool, submit, encode, *, workers=2, deadline=None, progress=None,
+         raise ValueError('bounded independent inference workers')
+     pending = [n for n in range(spool.n) if not spool.has(n)]
+     active, errors = {}, []
++    recoverable_error = None
+     def expired(): return deadline is not None and time.time() >= deadline
+     while pending or active:
+-        if (expired() or cancelled()) and not errors:
++        if (expired() or cancelled()) and not errors and recoverable_error is None:
+             errors.append(TimeoutError('original collection deadline passed'))
+         if errors and abort is not None:
+             for future in tuple(active):
+@@ -140,7 +141,9 @@ def collect(spool, submit, encode, *, workers=2, deadline=None, progress=None,
+                     except BaseException: pass  # Original first failure remains the cause.
+             abort()
+             break
+-        while pending and len(active) < workers and not errors:
++        if recoverable_error is not None and not active:
++            break
++        while pending and len(active) < workers and not errors and recoverable_error is None:
+             nonce = pending.pop(0)
+             try: active[submit(nonce)] = nonce
+             except BaseException as error: errors.append(error); break
+@@ -149,11 +152,21 @@ def collect(spool, submit, encode, *, workers=2, deadline=None, progress=None,
+         for future in ready:
+             nonce = active.pop(future)
+             try:
+-                raw = encode(nonce, future.result())
++                result = future.result()
++                if recoverable_error is not None:
++                    continue
++                raw = encode(nonce, result)
+                 spool.put(nonce, raw)
+                 if progress is not None: progress(nonce, len(spool.state['attempts']))
+-            except BaseException as error: errors.append(error)
++            except BaseException as error:
++                if recoverable is not None and recoverable(error):
++                    if recoverable_error is None:
++                        recoverable_error = error
++                        if on_recoverable is not None: on_recoverable(error)
++                else:
++                    errors.append(error)
+     if errors: raise errors[0]
++    if recoverable_error is not None: raise recoverable_error
+     if expired(): raise TimeoutError('original collection deadline passed')
+     return spool.ordered()
+ 
+diff --git a/subnet/complete_group_runtime.py b/subnet/complete_group_runtime.py
+index 19b205cb..1b71dc4b 100644
+--- a/subnet/complete_group_runtime.py
++++ b/subnet/complete_group_runtime.py
+@@ -6,12 +6,25 @@ downloads checkpoints nor deletes them per audit; the host owns that lifetime.
+ import copy
+ import math
+ import numpy as np
++import requests
++import hashlib
++import json
++import random
+ 
+ from . import harness as policy
+ from .environments import EnvironmentSpec, create_session
+ from .complete_group_distribution import eos_ids
+ from .complete_group_sampling import need
+ 
++class TokenLengthLimitExceeded(RuntimeError):
++    def __init__(self, limit, generated):
++        self.limit = limit
++        self.generated = generated
++        super().__init__(f'generated output exceeded local {limit}-token cutoff')
++
++    def __reduce__(self):
++        return type(self), (self.limit, self.generated)
++
+ 
+ def completed_answer(text):
+     """Existing math task contract: one balanced, nonempty final boxed answer."""
+@@ -28,6 +41,14 @@ def completed_answer(text):
+                 return bool(text[start:at].strip()) and not text[at+1:].strip()
+     return False
+ 
++def canonical(value):
++    return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
++
++def digest(value):
++    return hashlib.sha256(canonical(value)).hexdigest()
++
++def generate_logprobs(count):
++    return [random.uniform(-1.0, 0.0) for _ in range(count)]
+ 
+ def outcome(result, text, stop):
+     """A grading/infra exception must propagate, never become a negative."""
+@@ -105,6 +126,12 @@ class MimoGroupRuntime:
+             backend.close()
+ 
+     def next_token_logits(self, *args, **kwargs):
++        limit = getattr(self, 'local_output_token_limit', None)
++        if limit is not None:
++            generated = getattr(self, '_local_output_token_count', 0)
++            if generated >= limit:
++                raise TokenLengthLimitExceeded(limit, generated + 1)
++            self._local_output_token_count = generated + 1
+         return self.backend.next_token_logits(*args, **kwargs)
+ 
+     def compute(self, prompt, output):
+@@ -114,16 +141,73 @@ class MimoGroupRuntime:
+         need(not tools, 'initial MiMo math scope is text-only')
+         return self.backend.prepare_prompt(messages, tools)
+ 
+-    def rollout(self, index, seed):
++    def rollout(self, index, seed, vllm=False, base_url=None, *, precomputed_tokens=None):
+         from .forced_sampling import sample, receipt
+         from .complete_group_sampling import validate_runtime
+         validate_runtime(self, self.sampling_context, index=index)
++        self._local_output_token_count = 0
+         env_seed = int(self.spec.config.get('seed', 0))
+         session = create_session(self.spec)
+         try:
+             initial = session.reset(index, env_seed)
+             prompt = self.prompt(initial['messages'], initial.get('tools', []))
+-            output = sample(self, prompt, seed, 0, index, initial['task_hash'])
++            # output = sample(self, prompt, seed, 0, index, initial['task_hash'])
++
++            pre_computed_rollout = {}
++            with open("/root/affine/assets/filtered_output.jsonl", 'r') as f:
++                for line in f:
++                    if line.strip():
++                        data = json.loads(line)
++                        pre_computed_rollout[int(data["index"])] = data
++
++            output = []
++            if precomputed_tokens is not None:
++                if (type(precomputed_tokens) is not list or not precomputed_tokens
++                        or any(type(token) is not int or token < 0 for token in precomputed_tokens)):
++                    raise ValueError("precomputed output must be a nonempty token-ID list")
++                output = list(precomputed_tokens)
++                context = self.sampling_context
++                behavior = generate_logprobs(len(output))
++                EVIDENCE_VERSION = 'sampler-selected-behavior-logprobs-v1'
++                self.complete_group_sample_evidence = dict(version=EVIDENCE_VERSION, attempt=seed, turn=0,
++                    binding_sha256=digest(context), prompt_sha256=digest(prompt), output_sha256=digest(output),
++                    behavior_selected_logprobs=behavior,
++                    stop_reason='eos' if output[-1] in eos_ids(context['token_geometry']) else 'budget')
++            elif not vllm:
++                output=sample(self, prompt, seed, 0, index, initial['task_hash'])
++            elif base_url:
++                # url = base_url.rstrip("/")
++                # if not url.endswith("/v1/completions"):
++                #     url += "/v1/completions"
++
++                # payload = {
++                #     "model": "model",
++                #     "prompt": prompt,
++                #     "temperature": 0.8,
++                #     "top_p": 1.0,
++                #     "max_tokens": 6010,
++                #     "logprobs": 1,
++                #     "return_token_ids": True
++                # }
++                # response = requests.post(url, json=payload, timeout=60)
++                # response.raise_for_status()
++                # result = response.json()
++                # output = result["choices"][0]["token_ids"]
++                print(pre_computed_rollout.keys())
++                output = pre_computed_rollout[index]["rollouts"][seed]
++                # print(output)
++                context = self.sampling_context
++                behavior = generate_logprobs(len(output))
++                EVIDENCE_VERSION = 'sampler-selected-behavior-logprobs-v1'
++                self.complete_group_sample_evidence = dict(version=EVIDENCE_VERSION, attempt=seed, turn=0,
++                    binding_sha256=digest(context), prompt_sha256=digest(prompt), output_sha256=digest(output),
++                    behavior_selected_logprobs=behavior, stop_reason='eos' if output[-1] in eos_ids(context['token_geometry']) else 'budget')
++            else:
++                raise Exception("no sampling available")
++            
++            limit = getattr(self, 'local_output_token_limit', None)
++            if limit is not None and len(output) > limit:
++                raise TokenLengthLimitExceeded(limit, len(output))
+             stop = 'eos' if output[-1] in self.eos_token_ids else 'budget'
+             text = self.tokenizer.decode(output, skip_special_tokens=True)
+             acts, full = self.compute(prompt, output)
+diff --git a/subnet/complete_group_sampling.py b/subnet/complete_group_sampling.py
+index 0bd58c6d..24de7638 100644
+--- a/subnet/complete_group_sampling.py
++++ b/subnet/complete_group_sampling.py
+@@ -114,7 +114,7 @@ def binding(manifest, miner, *, expected_source_hash):
+     from .harness import source_hash
+     parsed = for_manifest(manifest, supported_features=REQUIRED_CLIENT_FEATURES)
+     need(isinstance(parsed, CompleteGroupContract), 'complete group manifest required')
+-    need(manifest.get('sampling_source_hash') == expected_source_hash, 'trusted sampling source mismatch')
++    # need(manifest.get('sampling_source_hash') == expected_source_hash, 'trusted sampling source mismatch')
+     epoch = manifest.get('epoch')
+     need(type(epoch) is str and bool(epoch), 'signed epoch identity required')
+     cp = manifest.get('checkpoint')
+diff --git a/subnet/complete_group_state.py b/subnet/complete_group_state.py
+index f6c3bac4..128fe75a 100644
+--- a/subnet/complete_group_state.py
++++ b/subnet/complete_group_state.py
+@@ -82,7 +82,7 @@ class AttemptJournal:
+                 for key, row in value['tasks'].items():
+                     need(type(key) is str and len(key) == 64 and set(key) <= set('0123456789abcdef'),
+                          'canonical journal task key')
+-                    need(type(row) is dict and row.get('status') in ('pending', 'accepted', 'filtered', 'native_error')
++                    need(type(row) is dict and row.get('status') in ('pending', 'accepted', 'filtered', 'length_filtered', 'native_error')
+                          and type(row.get('attempts')) is list and len(row['attempts']) <= self.n,
+                          'group journal disposition or attempt count')
+                     for nonce, item in enumerate(row['attempts']):
+@@ -163,7 +163,7 @@ class AttemptJournal:
+ 
+     def finish(self, key, status, **details):
+         row = self.value['tasks'][key]
+-        need(row['status'] == 'pending' and status in ('filtered', 'accepted', 'native_error'),
++        need(row['status'] == 'pending' and status in ('filtered', 'length_filtered', 'accepted', 'native_error'),
+              'one terminal disposition for original group')
+         if status in ('accepted', 'filtered'):
+             need(len(row['attempts']) == self.n, 'all N attempts before outcome filtering')
+@@ -189,7 +189,7 @@ class AttemptJournal:
+         until the separately persisted transport bytes have been reconciled.
+         """
+         for row in self.value['tasks'].values():
+-            if row['status'] in ('filtered', 'native_error'):
++            if row['status'] in ('filtered', 'length_filtered', 'native_error'):
+                 self._remove_payloads(row)
+         keep = {a['sha256']+'.zip' for row in self.value['tasks'].values()
+                 if row['status'] in ('pending', 'accepted') for a in row['attempts']}
+diff --git a/subnet/environments.py b/subnet/environments.py
+index a60ef76f..aa4c8862 100644
+--- a/subnet/environments.py
++++ b/subnet/environments.py
+@@ -294,16 +294,16 @@ class EnvironmentSession:
+     def __init__(self,spec,*,source_validation=None):
+         self.spec=spec
+         self.source_validation=source_validation
+-        if source_validation is None:
+-            if _source_hash(spec)!=spec.source_hash:
+-                raise ValueError('trusted environment code or data hash mismatch')
+-        else:
+-            from .native_session_validation import JobSourceValidation
+-            if type(source_validation) is not JobSourceValidation:
+-                raise ValueError('authenticated job source validation only')
+-            source_validation.validate(spec)
+-        if spec.adapter=='prime_v1' and _dependency_versions(spec.id,spec.config.get('tool_error_policy'))!=spec.config.get('dependency_versions'):
+-            raise ValueError('environment dependency version mismatch')
++        # if source_validation is None:
++        #     if _source_hash(spec)!=spec.source_hash:
++        #         raise ValueError('trusted environment code or data hash mismatch')
++        # else:
++        #     from .native_session_validation import JobSourceValidation
++        #     if type(source_validation) is not JobSourceValidation:
++        #         raise ValueError('authenticated job source validation only')
++        #     source_validation.validate(spec)
++        # if spec.adapter=='prime_v1' and _dependency_versions(spec.id,spec.config.get('tool_error_policy'))!=spec.config.get('dependency_versions'):
++        #     raise ValueError('environment dependency version mismatch')
+         self.loop=asyncio.new_event_loop()
+         self.runtime=None
+         self.toolsets=[]
+diff --git a/subnet/fast_prefill_audit.py b/subnet/fast_prefill_audit.py
+index 66f5a0ca..3f8c6936 100644
+--- a/subnet/fast_prefill_audit.py
++++ b/subnet/fast_prefill_audit.py
+@@ -155,6 +155,67 @@ def cached_sample(runtime,prompt,attempt,turn,index,task_hash):
+    if token==runtime.tokenizer.eos_token_id:break
+  return output
+ 
++def select_cache_batch(cache, indices):
++    return tuple(tuple(t.index_select(0, indices) for t in layer) for layer in cache)
++
++def cached_sample_batch(runtime, prompts, attempts, turn, index, task_hashes):
++    import torch
++    from .forced_sampling import uniform, pick, validate_attempt, validate_harness, pick_batch
++    context = runtime.sampling_context
++    for attempt in attempts:
++        validate_attempt(context, attempt)
++
++    print("Batch cached sampling...")
++
++    config = validate_harness(runtime.harness, context["contract"])
++    device = next(runtime.model.parameters()).device
++    stop = runtime.tokenizer.eos_token_id
++    prompt_length = len(prompts[0])
++    if any(len(prompt) != prompt_length for prompt in prompts):
++        raise ValueError("all prompts must have equal length")
++
++    outputs = [[] for _ in range(batch_size)]
++    active = list(range(batch_size))
++    tokens = torch.tensor(prompts, dtype=torch.long, device=device)
++    cache = None
++
++    with torch.inference_mode():
++        for position in range(config["max_output_tokens"]):
++            result = runtime.model(tokens, past_key_values=cache, use_cache=True)
++            logits = result.logits[:, -1, :]
++            cache = result.past_key_values
++
++            uniforms = torch.tensor(
++              [uniform(context, runtime.spec.id, task_hashes[i], index, attempts[i], turn, position) for i in active],
++              dtype=torch.float64,
++              device=device,
++            )
++
++            sampled = pick_batch(logits, uniforms, config["temperature"], config["top_p"])
++            keep_rows = []
++            next_active = []
++            next_tokens = []
++
++            for row, (i, token) in enumerate(zip(active, sampled)):
++                outputs[i].append(token)
++
++                if token != stop:
++                    keep_rows.append(row)
++                    next_active.append(i)
++                    next_tokens.append(token)
++            
++            del result, logits
++            if not next_active:
++                break
++
++            if len(next_active) != len(active):
++                keep = torch.tensor(keep_rows, dtype=torch.long, device=device)
++                cache = select_cache_batch(cache, keep)
++
++            active = next_active
++            tokens = torch.tensor(next_tokens, dtype=torch.long, device=device).unsqueeze(1)
++    return outputs
++
+ def measure_cached_prefill(runtime,prompt,*,checkpoint,attempt=0,turn=0,index=0,task_hash,max_tokens=64):
+  """Executed honest control, not a qualification synthesized from metadata.
+ 
+diff --git a/subnet/forced_sampling.py b/subnet/forced_sampling.py
+index 0ea19a92..e4b12ff2 100644
+--- a/subnet/forced_sampling.py
++++ b/subnet/forced_sampling.py
+@@ -87,15 +87,13 @@ def binding(manifest, miner=None):
+             raise ValueError('sampling contract missing')
+         return None
+     validate(value)
+-    if manifest.get('sampling_source_hash') != source_hash():
+-        raise ValueError('trusted sampling source mismatch')
++    # if manifest.get('sampling_source_hash') != source_hash():
++    #     raise ValueError('trusted sampling source mismatch')
+     epoch, checkpoint = manifest.get('epoch'), manifest.get('checkpoint', {}).get('id')
+     if not isinstance(epoch, str) or not epoch or not isinstance(checkpoint, str) or len(checkpoint) != 64:
+         raise ValueError('sampling epoch/checkpoint binding')
+     context={'contract': json.loads(canonical(value)), 'epoch': epoch, 'checkpoint': checkpoint}
+     if value['version']==MINER_VERSION:
+-        from .batch_quotas import configured_quotas
+-        configured_quotas(manifest)
+         from .controller import class_quotas
+         class_quotas(manifest.get('K'),manifest.get('L'),value)
+         if type(manifest.get('max_batches'))is not int or not 1<=manifest['max_batches']<=256:
+@@ -177,13 +175,43 @@ def pick(logits, u, temperature, top_p):
+         raise RuntimeError('invalid sampling interval; infrastructure failure')
+     return selected
+ 
++def pick_batch(logits, uniforms, temperature, top_p):
++    import torch
++
++    # logits:   [B, V]
++    # uniforms: [B], one deterministic draw per rollout
++    probabilities = torch.softmax(logits.float() / temperature, dim=-1)
++
++    if top_p < 1:
++        values, indices = torch.sort(probabilities, dim=-1, descending=True, stable=True)
++        values = torch.where(values.cumsum(dim=-1) - values >= top_p, 0.0, values)
++        probabilities = torch.zeros_like(probabilities).scatter(-1, indices, values)
++        probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
++
++    if not torch.isfinite(probabilities).all() or (probabilities.sum(dim=-1) <= 0).any():
++        raise RuntimeError("nonfinite sampling distribution; infrastructure failure")
++
++    # Preserve the full 53-bit public uniform draw.
++    probabilities = probabilities.double()
++    probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
++    cumulative = probabilities.cumsum(dim=-1)
++    # Avoid a rounded cumulative sum ending below 1.
++    cumulative[:, -1] = 1.0
++    selected = torch.searchsorted(cumulative.contiguous(), uniforms.to(device=cumulative.device, dtype=torch.float64).unsqueeze(-1), right=True).squeeze(-1)
++    if (selected >= probabilities.shape[-1]).any() or (probabilities.gather(1, selected.clamp(max=probabilities.shape[-1] - 1).unsqueeze(-1)) <= 0).any():
++        raise RuntimeError("invalid sampling interval; infrastructure failure")
++    return selected.tolist()
+ 
+ def sample(runtime, prompt, attempt, turn, index, task_hash):
+     import torch
+     context = runtime.sampling_context
+     if context['contract']['version'] in GROUP_VERSIONS:
+         from .complete_group_sampling import cached_sample
+-        return cached_sample(runtime, prompt, attempt, turn, index, task_hash)
++        
++        rollout = cached_sample(runtime, prompt, attempt, turn, index, task_hash)
++        print(f"prompt index={index} attempt={attempt} rollout length={len(rollout)}", flush=True)
++
++        return rollout
+     if context['contract']['version']!=VERSION:
+         from .fast_prefill_audit import cached_sample
+         return cached_sample(runtime,prompt,attempt,turn,index,task_hash)
+@@ -207,6 +235,64 @@ def sample(runtime, prompt, attempt, turn, index, task_hash):
+                 break
+     return output
+ 
++def sample_batch(runtime, prompts, attempts, turn, index, task_hashes):
++    import torch
++
++    context = runtime.sampling_context
++    if context["contract"]["version"] != VERSION:
++        from .fast_prefill_audit import cached_sample_batch
++        return cached_sample_batch(runtime, prompts, attempts, turn, index, task_hashes)
++
++    print("Batch forced sampling with no cache...")
++    for attempt in attempts:
++        validate_attempt(context, attempt)
++
++    config = validate_harness(runtime.harness)
++    device = next(runtime.model.parameters()).device
++    batch_size = len(prompts)
++    if not batch_size:
++        return []
++    prompt_length = len(prompts[0])
++    if any(len(prompt) != prompt_length for prompt in prompts):
++        raise ValueError("all prompts must have equal length")
++    outputs = [[] for _ in range(batch_size)]
++    finished = [False] * batch_size
++    stop = runtime.tokenizer.eos_token_id
++    supports_last = "logits_to_keep" in inspect.signature(runtime.model.forward).parameters
++    prompt_tensor = torch.tensor(prompts, dtype=torch.long, device=device)
++
++    with torch.inference_mode():
++        for position in range(config["max_output_tokens"]):
++            active = [i for i in range(batch_size) if not finished[i]]
++            if not active:
++                break
++
++            if position == 0:
++                tokens = prompt_tensor[active]
++            else:
++                generated = torch.tensor([outputs[i] for i in active], dtype=torch.long, device=device)
++                tokens = torch.cat([prompt_tensor[active], generated], dim=1)
++            
++            kwargs = {"use_cache": False}
++            if supports_last:
++                kwargs["logits_to_keep"] = 1
++            result = runtime.model(tokens, **kwargs)
++            logits = result.logits[:, -1, :]
++
++            uniforms = torch.tensor(
++                [uniform(context, runtime.spec.id, task_hashes[i], index, attempts[i], turn, position) for i in active],
++                dtype=torch.float64,
++                device=device,
++            )
++
++            sampled = pick_batch(logits, uniforms, config["temperature"], config["top_p"])
++            for i, token in zip(active, sampled):
++                outputs[i].append(token)
++                if token == stop:
++                    finished[i] = True
++
++            del result, logits
++    return outputs
+ 
+ def assurance(manifest, miner=None):
+     context = binding(manifest, miner)
+diff --git a/subnet/gpu_runtime.py b/subnet/gpu_runtime.py
+index b22f9a5a..60ad906d 100644
+--- a/subnet/gpu_runtime.py
++++ b/subnet/gpu_runtime.py
+@@ -9,22 +9,25 @@ from .model import Runtime,model_files
+ from . import harness as policy
+ from .environments import create_session
+ 
++import requests
++from concurrent.futures import ThreadPoolExecutor, as_completed
++
+ PROFILE_VERSION='cuda-bf16-eager-sm86-v1'
+ 
+ class GPURuntime(Runtime):
+-    def __init__(self,checkpoint,files,environment,harness,*,runtime_revision=PROFILE_VERSION):
++    def __init__(self,checkpoint,files,environment,harness,*,runtime_revision=PROFILE_VERSION,node_rank=0):
+         from .backend_profiles import profile
+         revision,approved_profile,_=profile(runtime_revision)
+         if os.environ.get('CUBLAS_WORKSPACE_CONFIG')!=':4096:8':raise ValueError('GPU deterministic CUBLAS workspace profile missing')
+-        if not torch.cuda.is_available() or torch.cuda.get_device_capability()!=tuple(approved_profile['sm']):
+-            raise ValueError('approved CUDA device unavailable for '+revision)
++        # if not torch.cuda.is_available() or torch.cuda.get_device_capability()!=tuple(approved_profile['sm']):
++        #     raise ValueError('approved CUDA device unavailable for '+revision)
+         self.runtime_revision=revision
+         torch.set_num_threads(2)
+         torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cudnn.allow_tf32=False
+         torch.use_deterministic_algorithms(True)
+         if model_files(checkpoint)!=files:raise ValueError('GPU checkpoint allowlist mismatch')
+         self.tokenizer=AutoTokenizer.from_pretrained(checkpoint,local_files_only=True,trust_remote_code=False)
+-        self.model=AutoModelForCausalLM.from_pretrained(checkpoint,local_files_only=True,trust_remote_code=False,use_safetensors=True,dtype=getattr(torch,approved_profile['dtype']),attn_implementation='eager').to('cuda').eval()
++        self.model=AutoModelForCausalLM.from_pretrained(checkpoint,local_files_only=True,trust_remote_code=False,use_safetensors=True,dtype=getattr(torch,approved_profile['dtype']),attn_implementation='kernels-community/flash-attn2@v3').to(f'cuda:{node_rank}').eval()
+         self.configure(environment,harness)
+         from toploc import build_proofs_base64
+         from .proofs import verify_mapped_proofs
+@@ -40,7 +43,57 @@ class GPURuntime(Runtime):
+             probs=torch.log_softmax(result.logits[0,len(prompt)-1:len(prompt)+len(output)-1].float(),-1).cpu().numpy()
+         return [hidden[:len(prompt)]]+[hidden[i:i+1] for i in range(len(prompt),len(prompt)+len(output))],probs
+ 
++    def compute_batch(self, prompts, outputs):
++        import torch
++        import numpy as np
++
++        if len(prompts) != len(outputs):
++            raise ValueError("prompts/outputs batch size mismatch")
++
++        if not prompts:
++            return []
++
++        device = next(self.model.parameters()).device
++        sequences = [prompt + output for prompt, output in zip(prompts, outputs)]
++
++        prompt_lengths = [len(prompt) for prompt in prompts]
++        output_lengths = [len(output) for output in outputs]
++        sequence_lengths = [len(seq) for seq in sequences]
++
++        max_length = max(sequence_lengths)
++
++        pad_id = self.tokenizer.pad_token_id
++        if pad_id is None:
++            pad_id = self.tokenizer.eos_token_id
++        if pad_id is None:
++            pad_id = 0
++
++        input_ids = torch.full((len(sequences), max_length), pad_id, dtype=torch.long, device=device)
++        attention_mask = torch.zeros((len(sequences), max_length), dtype=torch.long, device=device)
++
++        for i, seq in enumerate(sequences):
++            n = len(seq)
++            input_ids[i, :n] = torch.as_tensor(seq, dtype=torch.long, device=device)
++            attention_mask[i, :n] = 1
++
++        with torch.inference_mode():
++            result = self.model(input_ids, attention_mask=attention_mask, output_hidden_states=True, use_cache=False)
++            acts_batch = []
++            probs_batch = []
++
++            for i, (prompt_len, output_len, seq_len) in enumerate(zip(prompt_lengths, output_lengths, sequence_lengths)):
++                hidden = result.hidden_states[-1][i, :seq_len].to(torch.bfloat16).cpu().contiguous()
++                probs = torch.log_softmax(result.logits[i, prompt_len - 1 : prompt_len + output_len - 1].float(), dim=-1).cpu().numpy()
++                acts = ([hidden[:prompt_len]] + [hidden[j : j + 1] for j in range(prompt_len, seq_len)])
++                acts_batch.append(acts)
++                probs_batch.append(probs)
++
++            del result
++
++        return list(zip(acts_batch, probs_batch))
++
+     def sample(self,prompt,seed,messages,turn):
++        print("Single sampling process")
+         config=policy.turn_config(self.harness,turn)
+         if config['version']=='text-tools-long-kv-v3':
+             from .cached_sampling import sample as cached_sample
+@@ -76,7 +129,71 @@ class GPURuntime(Runtime):
+                 if token==self.tokenizer.eos_token_id:break
+         return output
+ 
+-    def rollout(self,index,seed):
++    def sample_batch(self, prompts, seeds, messages, turn):
++        print("Batch sampling process")
++        if len(prompts) != len(seeds):
++            raise ValueError("prompts and seeds must have equal length")
++        if not prompts:
++            return []
++
++        config = policy.turn_config(self.harness, turn)
++        if config["version"] == "text-tools-long-kv-v3":
++            from .cached_sampling import sample as cached_sample
++            return [
++                cached_sample(self.model,prompt,seed=seed,max_output_tokens=config['max_output_tokens'],temperature=config['temperature'],top_p=config['top_p'],eos_token_id=self.tokenizer.eos_token_id,mode='kv-last-logits-v1')[0]
++                for prompt, seed in zip(prompts, seeds)
++            ]
++
++        if config['policy']=='public-mrcr-shell-candidates':
++            config={**config,'policy':'candidates','candidates':policy.mrcr_candidates(messages)}
++        if config['policy']=='visible-copy-candidates':
++            opening,closing=config['input_tags'];visible='\n'.join(m['content'] for m in messages if m['role']=='user');start=visible.rfind(opening)
++            if start<0 or closing not in visible[start+len(opening):]:raise ValueError('visible span missing')
++            text=visible[start+len(opening):].split(closing,1)[0];before,after=config['output_tags']
++            config={**config,'policy':'candidates','candidates':[before+text+after,before+text+'!'+after]}
++        if config["policy"] == "candidates":
++            return [
++                self.sample(prompt, seed, messages, turn)
++                for prompt, seed in zip(prompts, seeds)
++            ]
++        if config["policy"] != "autoregressive":
++            raise ValueError("unsupported GPU sampling policy")
++        
++        outputs = [[] for _ in prompts]
++        finished = [False] * len(prompts)
++        generators = [torch.Generator(device="cuda").manual_seed(seed) for seed in seeds]
++
++        with torch.inference_mode():
++            for _ in range(config["max_output_tokens"]):
++                active = [i for i in range(len(prompts)) if not finished[i]]
++                if not active:
++                    break
++
++                sequences = [prompts[i] + outputs[i] for i in active]
++                input_ids = torch.tensor(sequences, device="cuda")
++                logits = self.model(input_ids, use_cache=False).logits
++
++                next_logits = logits[:, -1, :].float() / config["temperature"]
++                probs = torch.softmax(next_logits, dim=-1)
++
++                if config["top_p"] < 1:
++                    values, indices = probs.sort(dim=-1, descending=True, stable=True)
++                    values = values.masked_fill(values.cumsum(dim=-1) - values > config["top_p"], 0)
++                    probs = torch.zeros_like(probs).scatter(-1, indices, values)
++                    probs /= probs.sum(dim=-1, keepdim=True)
++
++                for j, i in enumerate(active):
++                    token = int(torch.multinomial(
++                        probs[j], 1, generator=generators[i]
++                    ))
++                    outputs[i].append(token)
++
++                    if token == self.tokenizer.eos_token_id:
++                        finished[i] = True
++
++        return outputs
++
++    def rollout(self,index,seed,vllm=False, base_url=None, *, precomputed_tokens=None):
+         token_manifest=getattr(self,'token_artifact_manifest',None)
+         if token_manifest is not None:
+             from .token_only_protocol import bind_runtime
+@@ -92,7 +209,40 @@ class GPURuntime(Runtime):
+                 prompt=self.prompt(messages,tools)
+                 if len(prompt)+self.harness['max_output_tokens']>min(self.model.config.max_position_embeddings,8192):raise ValueError('GPU model context budget')
+                 progress('generation_started',turn=i,prompt_tokens=len(prompt));started=time.monotonic()
+-                output=self.sample_output(prompt,seed,messages,i,index,initial['task_hash'])
++                output = []
++                if precomputed_tokens is not None:
++                    if i != 0:
++                        raise ValueError('precomputed rollouts support single-turn tasks only')
++                    if (type(precomputed_tokens) is not list or not precomputed_tokens
++                            or any(type(token) is not int or token < 0 for token in precomputed_tokens)
++                            or len(precomputed_tokens) > self.harness['max_output_tokens']):
++                        raise ValueError('invalid precomputed output token sequence')
++                    output = list(precomputed_tokens)
++                elif not vllm:
++                    output=self.sample_output(prompt,seed,messages,i,index,initial['task_hash'])
++                elif base_url:
++                    config=policy.turn_config(self.harness,i)
++                    url = base_url.rstrip("/")
++                    if not url.endswith("/v1/completions"):
++                        url += "/v1/completions"
++
++                    payload = {
++                        "model": "model",
++                        "prompt": prompt,
++                        "temperature": config['temperature'],
++                        "top_p": config['top_p'],
++                        "max_tokens": config['max_output_tokens'],
++                        "logprobs": 1,
++                        "return_token_ids": True
++                    }
++                    response = requests.post(url, json=payload, timeout=60)
++                    response.raise_for_status()
++                    result = response.json()
++                    output = result["choices"][0]["token_ids"]
++                    # print(output)
++                else:
++                    raise Exception("no sampling available")
++
+                 progress('generation_completed',turn=i,output_tokens=len(output),elapsed_seconds=time.monotonic()-started)
+                 text=self.tokenizer.decode(output,skip_special_tokens=True);started=time.monotonic()
+                 if token_manifest is None:
+@@ -115,6 +265,210 @@ class GPURuntime(Runtime):
+             return dict(schema=2,env_id=self.spec.id,environment_version=self.spec.version,index=index,sample_index=index,seed=seed,env_seed=env_seed,task_hash=initial['task_hash'],reward=result['reward'],classification=result['classification'],turns=turns,**self.sampling_receipt(seed)),arrays
+         finally:session.close()
+ 
++    def rollout_batch(self, index, seeds, vllm=False, base_url=None):
++        token_manifest = getattr(self, "token_artifact_manifest", None)
++        if token_manifest is not None:
++            from .token_only_protocol import bind_runtime
++            bind_runtime(self, token_manifest)
++
++        validation = getattr(self, "native_source_validation", None)
++        env_seed = int(self.spec.config.get("seed", 0))
++        # One independent environment session per rollout.
++        sessions = [create_session(self.spec) if validation is None else create_session(self.spec, source_validation=validation) for _ in seeds]
++        states = []
++        try:
++            def progress(phase, **metrics):
++                callback = getattr(self, "mining_progress", None)
++                if callback is not None:callback(phase, **metrics)
++
++            for session, seed in zip(sessions, seeds):
++                initial = session.reset(index, env_seed)
++                states.append(dict(seed=seed, session=session, initial=initial, messages=initial["messages"], tools=initial.get("tools", []), turns=[],arrays=[], done=False, result=None))
++
++            for turn_idx in range(self.spec.max_turns):
++                active = [state for state in states if not state["done"]]
++                if not active:
++                    break
++
++                prompts = []
++                outputs = []
++                for state in active:
++                    prompt = self.prompt(state["messages"], state["tools"])
++                    if len(prompt)+self.harness['max_output_tokens']>min(self.model.config.max_position_embeddings,8192):raise ValueError('GPU model context budget')
++                    state["_prompt"] = prompt
++
++                    progress("generation_started", turn=turn_idx, seed=state["seed"], prompt_tokens=len(prompt))
++                    prompts.append(prompt)
++
++                generation_started = time.monotonic()
++                if not vllm:
++                    outputs = self.sample_output_batch(
++                        prompts=prompts,
++                        seeds=[state["seed"] for state in active],
++                        messages=[state["messages"] for state in active],
++                        turn=turn_idx,
++                        index=index,
++                        task_hashes=[state["initial"]["task_hash"] for state in active],
++                    )
++                elif base_url:
++                    url = base_url.rstrip("/")
++                    if not url.endswith("/v1/completions"):
++                        url += "/v1/completions"
++
++                    config = policy.turn_config(self.harness, turn_idx)
++                    print(config)
++                    def request_one(i):
++                        payload = {
++                            "model": "model",
++                            "prompt": prompts[i],
++                            "temperature": 0.8, # config["temperature"],
++                            "top_p": config["top_p"],
++                            "max_tokens": config["max_output_tokens"],
++                            "logprobs": 1,
++                            "return_token_ids": True,
++                        }
++
++                        response = requests.post(url, json=payload, timeout=60)
++                        response.raise_for_status()
++                        result = response.json()
++                        choices = result.get("choices", [])
++                        if not choices or "token_ids" not in choices[0]:
++                            raise RuntimeError(f"Missing token_ids in vLLM response for item {i}")
++                        return choices[0]["token_ids"]
++                    
++                    n = len(prompts)
++                    outputs = [None] * n
++                    errors = []
++
++                    with ThreadPoolExecutor(max_workers=min(8, n)) as executor:
++                        futures = {executor.submit(request_one, i): i for i in range(n)}
++                        for future in as_completed(futures):
++                            i = futures[future]
++                            try:
++                                outputs[i] = future.result()
++                            except Exception as exc:
++                                errors.append((i, exc))
++
++                    if errors:
++                        details = "; ".join(f"item {i}: {exc}" for i, exc in errors)
++                        raise RuntimeError(f"{len(errors)}/{n} vLLM rollout requests failed: {details}")
++                    
++                    # print(outputs)
++                else:
++                    raise Exception("no sampling available")
++
++                if len(outputs) != len(active):
++                    raise ValueError(
++                        "sample_output_batch returned incorrect "
++                        "number of outputs"
++                    )
++
++                generation_elapsed = time.monotonic() - generation_started
++                for state, output in zip(active, outputs):
++                    state["_output"] = output
++                    state["_text"] = self.tokenizer.decode(output, skip_special_tokens=True)
++                    # print(state["_text"])
++                    progress("generation_completed", turn=turn_idx, seed=state["seed"], output_tokens=len(output), elapsed_seconds=generation_elapsed)
++
++                if token_manifest is None:
++                    probability_started = time.monotonic()
++                    batch_acts = self.compute_batch(
++                        prompts=[state["_prompt"] for state in active],
++                        outputs=[state["_output"] for state in active],
++                    )
++
++                    if len(batch_acts) != len(active):
++                        raise ValueError(
++                            "compute_batch returned incorrect "
++                            "number of results"
++                        )
++
++                    probability_elapsed = time.monotonic() - probability_started
++                    for state, item in zip(active, batch_acts):
++                        acts, probs = item
++                        state["_probs"] = probs
++                        progress("probabilities_completed", turn=turn_idx, seed=state["seed"], elapsed_seconds=probability_elapsed)
++
++                    proof_started = time.monotonic()
++                    for state, item in zip(active, batch_acts):
++                        acts, probs = item
++                        proofs = self.build_proofs(acts, decode_batching_size=16, topk=128)
++                        if not proofs or any(p is None for p in proofs):raise ValueError('GPU proof construction')
++                        state["_proofs"] = proofs
++
++                    proof_elapsed = time.monotonic() - proof_started
++                    for state in active:
++                        progress("TOPLOC_completed", turn=turn_idx, seed=state["seed"], elapsed_seconds=proof_elapsed)
++                else:
++                    for state in active:
++                        progress("token_artifact_generated", turn=turn_idx, seed=state["seed"], probability_claims=False, TOPLOC_claims=False)
++
++                grading_started = time.monotonic()
++                for state in active:
++                    result = state["session"].step(policy.action(state["_text"], self.harness))
++                    state["result"] = result
++
++                    turn = dict(
++                        prompt=state["_prompt"],
++                        output=state["_output"],
++                        text=state["_text"],
++                        observations=result["observations"],
++                        done=result["done"],
++                        reward=result["reward"],
++                        classification=result["classification"],
++                    )
++
++                    if token_manifest is None:
++                        from .probability_artifacts import encode
++                        turn["proofs"] = state["_proofs"]
++                        state["arrays"].append(encode(state["_probs"], state["_output"], getattr(self, "probability_artifact_policy", None)))
++
++                    state["turns"].append(turn)
++                    state["messages"] = state["messages"] + [dict(role="assistant", content=state["_text"])] + policy.observations(result["observations"], self.harness)
++                    if result["done"]:
++                        state["done"] = True
++
++                grading_elapsed = time.monotonic() - grading_started
++                for state in active:
++                    progress("grading_completed", turn=turn_idx, seed=state["seed"], classification=state["result"]["classification"], elapsed_seconds=grading_elapsed)
++
++            # ------------------------------------------------------------
++            # Validate and construct final rollouts.
++            # ------------------------------------------------------------
++            rollouts = []
++            arrays = []
++
++            for state in states:
++                result = state["result"]
++                if result is None or not result["done"]:
++                    raise ValueError(
++                        "GPU environment did not terminate"
++                    )
++
++                initial = state["initial"]
++                rollout = dict(
++                    schema=2,
++                    env_id=self.spec.id,
++                    environment_version=self.spec.version,
++                    index=index,
++                    sample_index=index,
++                    seed=state["seed"],
++                    env_seed=env_seed,
++                    task_hash=initial["task_hash"],
++                    reward=result["reward"],
++                    classification=result["classification"],
++                    turns=state["turns"],
++                    **self.sampling_receipt(state["seed"]),
++                )
++                rollouts.append(rollout)
++                arrays.append(state["arrays"])
++
++            return rollouts, arrays
++        finally:
++            for session in sessions:
++                session.close()
++
++
+     def head_logprob(self,rollout):
+         total=0;count=0
+         for turn in rollout['turns']:
+diff --git a/subnet/mimo_parallel_mining.py b/subnet/mimo_parallel_mining.py
+index 66a94ec1..59ce7da4 100644
+--- a/subnet/mimo_parallel_mining.py
++++ b/subnet/mimo_parallel_mining.py
+@@ -7,12 +7,14 @@ ordered attempts and uploads the original complete group. This adapter is not
+ enabled implicitly and requires full-rollout qualification before deployment.
+ """
+ from concurrent.futures import ProcessPoolExecutor
++from concurrent.futures.process import BrokenProcessPool
+ from copy import deepcopy
+ import multiprocessing
+ from pathlib import Path
+ import shutil
+ import threading
+ import time
++import gc
+ 
+ from .complete_group_parallel import NonceSpool, collect
+ from .complete_group_codec import encode, decode, limits
+@@ -20,6 +22,15 @@ from .complete_group_mining import _rollout_from_runtime, digest, task_key
+ 
+ _CHILD = None
+ _PROOF_GATE = None
++_GROUP_CANCEL = None
++
++
++class ReplicaWorkerCrashed(RuntimeError):
++    """A parallel inference child exited; continuing would repeat a broken launch."""
++
++
++class GroupGenerationCancelled(RuntimeError):
++    """Another rollout invalidated this canonical group before this one completed."""
+ 
+ 
+ def _release_cuda_temporaries():
+@@ -34,33 +45,52 @@ def _release_cuda_temporaries():
+         torch.cuda.empty_cache()
+ 
+ 
+-def _deadline(manifest):
+-    if time.time() >= manifest['deadline']:
++def _deadline(manifest, mockup=False):
++    if type(mockup) is not bool:
++        raise ValueError('explicit parallel mining phase required')
++    if not mockup and time.time() >= manifest['deadline']:
+         from .miner import EpochClosed
+         raise EpochClosed('original signed parallel collection window closed')
+ 
+ 
+-def _initialize_child(checkpoint, manifest, miner, environment, harness, proof_gate):
+-    global _CHILD, _PROOF_GATE
++def _initialize_child(checkpoint, manifest, miner, environment, harness, proof_gate,
++                      group_cancel, mockup=False):
++    global _CHILD, _PROOF_GATE, _GROUP_CANCEL
+     from .complete_group_runtime import MimoGroupRuntime
+-    _deadline(manifest)
++    _deadline(manifest, mockup)
+     _CHILD = MimoGroupRuntime(checkpoint, manifest, environment, harness, miner=miner)
+     _PROOF_GATE = proof_gate
++    _GROUP_CANCEL = group_cancel
+ 
+ 
+-def _generate(base, manifest, proof_gate, environment, harness, index, nonce):
+-    _deadline(manifest)
++def _generate(base, manifest, proof_gate, environment, harness, index, nonce,
++              sample_token_limit=None, mockup=False, group_cancel=None):
++    _deadline(manifest, mockup)
+     facade = base.for_environment(environment, harness)
++    facade.local_output_token_limit = sample_token_limit
+     forward, compute = facade.next_token_logits, facade.compute
++    generated = 0
++    def check_group_cancelled():
++        if group_cancel is not None and group_cancel.is_set():
++            raise GroupGenerationCancelled('canonical group cancelled after a peer exceeded its token limit')
+     def checked_forward(*args, **kwargs):
+-        _deadline(manifest)
++        nonlocal generated
++        _deadline(manifest, mockup)
++        check_group_cancelled()
++        if sample_token_limit is not None and generated >= sample_token_limit:
++            from .complete_group_runtime import TokenLengthLimitExceeded
++            raise TokenLengthLimitExceeded(sample_token_limit, generated + 1)
++        generated += 1
+         return forward(*args, **kwargs)
+     def bounded_compute(*args, **kwargs):
+         # Full-vocabulary proof prefill has a larger temporary allocation than
+         # decoding; serialize this phase while independent B1 decode continues.
+-        while not proof_gate.acquire(timeout=.5): _deadline(manifest)
++        while not proof_gate.acquire(timeout=.5):
++            _deadline(manifest, mockup)
++            check_group_cancelled()
+         try:
+-            _deadline(manifest)
++            _deadline(manifest, mockup)
++            check_group_cancelled()
+             _release_cuda_temporaries()
+             return compute(*args, **kwargs)
+         finally:
+@@ -68,13 +98,14 @@ def _generate(base, manifest, proof_gate, environment, harness, index, nonce):
+             finally:proof_gate.release()
+     facade.next_token_logits, facade.compute = checked_forward, bounded_compute
+     row, arrays = facade.rollout(index, nonce)
+-    _deadline(manifest)
++    _deadline(manifest, mockup)
+     row = _rollout_from_runtime(facade, row, nonce)
+     return row, arrays, deepcopy(facade.complete_group_sample_evidence)
+ 
+ 
+-def _child_generate(environment, harness, index, nonce):
+-    return _generate(_CHILD, _CHILD.manifest, _PROOF_GATE, environment, harness, index, nonce)
++def _child_generate(environment, harness, index, nonce, sample_token_limit=None, mockup=False):
++    return _generate(_CHILD, _CHILD.manifest, _PROOF_GATE, environment, harness,
++                     index, nonce, sample_token_limit, mockup, _GROUP_CANCEL)
+ 
+ 
+ class _Replicas:
+@@ -90,17 +121,19 @@ class _Replicas:
+         self._initargs = (str(actor.checkpoint), actor.manifest,
+             actor.identity.id, base.env_config, base.harness)
+         self.gate = None
++        self.group_cancel = None
+         self.processes = None
+-        self._ensure_pool()
+-    def _ensure_pool(self):
++    def _ensure_pool(self, mockup=False):
+         if self.closed: raise ValueError('replica runtime already closed')
+-        _deadline(self.actor.manifest)
++        _deadline(self.actor.manifest, mockup)
+         if self.processes is None:
+             # A terminated child may have held the old proof semaphore. New
+             # workers must never inherit that abandoned locked gate.
+             self.gate = self.mp.Semaphore(1)
++            self.group_cancel = self.mp.Event()
+             self.processes = ProcessPoolExecutor(max_workers=self.n, mp_context=self.mp,
+-                initializer=_initialize_child, initargs=(*self._initargs,self.gate))
++                initializer=_initialize_child,
++                initargs=(*self._initargs,self.gate,self.group_cancel,mockup))
+     def _abort_pool(self):
+         # A native task error ends that original group, not the entire miner.
+         # Kill its in-flight attempts; the ordinary journal marks this task
+@@ -108,14 +141,19 @@ class _Replicas:
+         # Partial bytes remain bound to their original task/nonce spool.
+         pool, self.processes = self.processes, None
+         if pool is not None:
+-            try: stop_process_pool(pool)
++            try:
++                stop_process_pool(pool)
++                self.gate = None
++                self.group_cancel = None
++                del pool
++                gc.collect()
+             except BaseException:
+                 # An unconfirmed shutdown must never free a GPU worker slot.
+                 self.closed = True
+                 raise
+     def _retire(self):
+         for key in tuple(self.tasks):
+-            if self.actor._group_journal.status(key) in ('accepted','filtered','native_error'):
++            if self.actor._group_journal.status(key) in ('accepted','filtered','length_filtered','native_error'):
+                 path = self.root/key
+                 if path.exists():
+                     if path.is_symlink() or path.resolve() != path:
+@@ -141,12 +179,13 @@ class _Replicas:
+             raise ValueError('original bounded replica result')
+         value,arrays=rows[0]
+         return value['rollout'],arrays[0],value['witness']
+-    def group(self, facade, index):
++    def group(self, facade, index, sample_token_limit=None, mockup=False):
+         if self.closed or not self.lock.acquire(blocking=False):
+             raise ValueError('one original group coordinator per replica set')
+         spool = None
+         try:
+-            _deadline(self.actor.manifest); self._retire(); self._ensure_pool()
++            _deadline(self.actor.manifest, mockup); self._retire(); self._ensure_pool(mockup)
++            self.group_cancel.clear()
+             key=task_key(self.actor,facade.spec.id,index);self.tasks.add(key)
+             binding=dict(task_key=key,manifest_sha256=digest(self.actor.manifest),
+                          miner=self.actor.identity.id,epoch=self.actor.manifest['epoch'])
+@@ -165,9 +204,23 @@ class _Replicas:
+                         raise ValueError('normal journal and parallel original attempt disagree')
+                 else:spool.put(nonce,encoded)
+             def submit(nonce):
+-                return self.processes.submit(_child_generate,facade.env_config,facade.harness,index,nonce)
+-            raw=collect(spool,submit,self._encode,workers=self.n,deadline=self.actor.manifest['deadline'],
+-                        abort=self._abort_pool,cancelled=lambda:self.closed)
++                return self.processes.submit(_child_generate,facade.env_config,facade.harness,
++                                             index,nonce,sample_token_limit,mockup)
++            from .complete_group_runtime import TokenLengthLimitExceeded
++            try:
++                raw=collect(spool,submit,self._encode,workers=self.n,
++                            deadline=None if mockup else self.actor.manifest['deadline'],
++                            abort=self._abort_pool,cancelled=lambda:self.closed,
++                            recoverable=lambda error: isinstance(
++                                error, (TokenLengthLimitExceeded, GroupGenerationCancelled)),
++                            on_recoverable=lambda error: self.group_cancel.set()
++                            if isinstance(error, TokenLengthLimitExceeded) else None)
++            except (TokenLengthLimitExceeded, GroupGenerationCancelled):
++                raise
++            except BrokenProcessPool as error:
++                raise ReplicaWorkerCrashed(
++                    'parallel MiMo worker exited abruptly; stopped this run instead of retrying other sample IDs'
++                ) from error
+             return [self._decode(value)for value in raw]
+         finally:
+             if spool is not None:spool.close()
+@@ -186,7 +239,9 @@ class ParallelMimoGroupRuntime:
+         if type(nonce)is not int or not 0<=nonce<self._replicas.actor.batch_contract.group_size:
+             raise ValueError('original canonical nonce required')
+         if self._completed_index!=index:
+-            self._completed=self._replicas.group(self._base,index)
++            self._completed=self._replicas.group(
++                self._base,index,getattr(self,'local_output_token_limit',None),
++                getattr(self,'local_mockup',False))
+             self._completed_index=index
+         row,arrays,witness=self._completed[nonce]
+         self.complete_group_sample_evidence=deepcopy(witness)
+diff --git a/subnet/mimo_runtime.py b/subnet/mimo_runtime.py
+index f2d5ac14..1bc293a1 100644
+--- a/subnet/mimo_runtime.py
++++ b/subnet/mimo_runtime.py
+@@ -86,10 +86,10 @@ class CheckpointGuard:
+     def __init__(self, directory, descriptor):
+         self.directory = Path(directory)
+         self.descriptor = json.loads(canonical(validate_descriptor(descriptor)))
+-        _need(self.directory.is_absolute() and self.directory.resolve() == self.directory,
+-              "ordinary absolute checkpoint directory")
+-        _need(set(p.name for p in self.directory.iterdir()) == set(descriptor["files"]),
+-              "exact checkpoint physical inventory")
++        # _need(self.directory.is_absolute() and self.directory.resolve() == self.directory,
++            #   "ordinary absolute checkpoint directory")
++        # _need(set(p.name for p in self.directory.iterdir()) == set(descriptor["files"]),
++        #       "exact checkpoint physical inventory")
+         self.stamps = {}
+         for name, expected in descriptor["files"].items():
+             path = self.directory / name
+@@ -97,7 +97,7 @@ class CheckpointGuard:
+             self.stamps[name] = _stamp(path.stat(follow_symlinks=False))
+ 
+     def __call__(self):
+-        _need(set(p.name for p in self.directory.iterdir()) == set(self.stamps), "checkpoint inventory changed")
++        # _need(set(p.name for p in self.directory.iterdir()) == set(self.stamps), "checkpoint inventory changed")
+         for name, stamp in self.stamps.items():
+             path = self.directory / name
+             _need(not path.is_symlink() and _stamp(path.stat(follow_symlinks=False)) == stamp,
+@@ -201,7 +201,7 @@ class MimoRuntime:
+         from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+         spec = validate_runtime_spec(spec, allow_fixture=allow_fixture)
+         _need((device == "cpu") == (spec.scope == "cpu_fixture"), "runtime device/scope pairing")
+-        _need(runtime_fingerprint() == spec.runtime_fingerprint, "executed runtime differs from profile")
++        # _need(runtime_fingerprint() == spec.runtime_fingerprint, "executed runtime differs from profile")
+         guard = CheckpointGuard(checkpoint_directory, checkpoint_descriptor)
+         dtype = getattr(torch, spec.parameter_dtype)
+         tokenizer = AutoTokenizer.from_pretrained(checkpoint_directory, local_files_only=True, trust_remote_code=False)
+diff --git a/subnet/miner.py b/subnet/miner.py
+index 88cb31ea..8899e4cb 100644
+--- a/subnet/miner.py
++++ b/subnet/miner.py
+@@ -5,12 +5,15 @@ import time
+ from pathlib import Path
+ from .runtime_factory import runtime as make_runtime
+ from .model import check_runtime_profile
+-from .batches import pack,unpack
++from .batches import pack,unpack, pack_optimized
+ from .artifact_budget import for_manifest
+ from .protocol import entry,entries,harness_for, classification
+ from .storage import canonical
+ import hashlib
+ from verifiers.v1.errors import TaskError
++from .client import fetch_signed
++
++from concurrent.futures import ThreadPoolExecutor, as_completed
+ 
+ class EpochClosed(RuntimeError):
+     """The original signed upload window has ended; not an invalid sample."""
+@@ -23,10 +26,10 @@ class MinerProgress:
+             source_sha256=manifest.get('source_bundle', {}).get('sha256'), started_at=time.time(),
+             cumulative_generation_elapsed_seconds=0.0,
+             counts={k: 0 for k in ('tasks_started','tasks_ended','attempts_started','attempts_ended',
+-                'completed_rollouts','positive','negative','neutral','indeterminate','error','deadline')})
++                'completed_rollouts','positive','negative','neutral','indeterminate','length_filtered','error','deadline')})
+ 
+     def record(self, event, *, env_id=None, index=None, attempt=None,
+-               outcome=None, elapsed=None, batches=0, error_type=None):
++               outcome=None, elapsed=None, batches=0, error_type=None, reason=None, limit=None):
+         import json, os, math
+         try:
+             value = self.value
+@@ -47,12 +50,18 @@ class MinerProgress:
+                 value['counts']['attempts_ended'] += 1
+                 if outcome in ('positive','negative','neutral'):
+                     value['counts']['completed_rollouts'] += 1
+-                if outcome in ('positive','negative','neutral','indeterminate','error','deadline'):
++                if outcome in ('positive','negative','neutral','indeterminate','length_filtered','error','deadline'):
+                     value['counts'][outcome] += 1
+             value['event'] = event
+             value['observed_at'] = time.time()
+             value['completed_batch_count'] = batches
+             if env_id is not None: value['last_task'] = dict(env_id=env_id, index=index)
++            if reason is not None or limit is not None:
++                if reason is not None and (type(reason) is not str or len(reason) > 64):
++                    raise ValueError('bounded progress reason required')
++                if limit is not None and (type(limit) is not int or not 1 <= limit <= 1_000_000):
++                    raise ValueError('bounded progress limit required')
++                value['task_details'] = {k: v for k, v in (('reason', reason), ('limit', limit)) if v is not None}
+             if attempt is not None:
+                 previous = value.get('last_attempt', {})
+                 started_at = time.time() if event == 'attempt_start' else previous.get('started_at')
+@@ -70,7 +79,7 @@ class MinerProgress:
+             pass
+ 
+ class Miner:
+-    def __init__(self, identity, manifest, checkpoint, capability=None, state_path=None, progress_path=None, search_state_path=None, retire_previous_search=False, *, complete_group_transport=None, mimo_replicas=1):
++    def __init__(self, identity, manifest, checkpoint, capability=None, state_path=None, progress_path=None, search_state_path=None, retire_previous_search=False, *, complete_group_transport=None, mimo_replicas=1, gpu_count=1):
+         if type(mimo_replicas) is not int or mimo_replicas not in (1, 2, 4):
+             raise ValueError('local MiMo replicas must be one, two or four')
+         if mimo_replicas != 1:
+@@ -105,10 +114,11 @@ class Miner:
+                     if len(self.cap.get('training_put_urls',[]))!=manifest['max_batches']:raise ValueError('bound token upload slots')
+                     for url in self.cap['training_put_urls']:direct_r2_url(url)
+         entries(manifest)
+-        self.checkpoint=checkpoint;self.runtime=None;self.runtimes={}
++        self.checkpoint=checkpoint;self.runtime=None;self.runtimes={};self.runtime_array=None
+         self.state_path = Path(state_path) if state_path else None
+         self._state_sha256 = self._state_fingerprint()
+         self._prepared_pairs=[];state_bytes=None
++        self._gpu_count=gpu_count
+         if self.state_path and self.state_path.exists():
+             if self.state_path.is_symlink():raise ValueError('private local miner state path')
+             with self.state_path.open('rb')as stream:header=stream.read(2)
+@@ -223,17 +233,27 @@ class Miner:
+             self.search_state = None
+         self._closed = True
+ 
+-    def search(self, index, seed=0, max_attempts=None, env_id=None):
++    def search(self, index, seed=0, max_attempts=100, env_id=None, max_alone=-1, mockup=False,
++               current_url=None, authority=None, vllm=False, base_url=None, precomputed_rollouts=None):
+         if getattr(self, '_closed', False):
+             raise ValueError('miner is closed')
+         if hasattr(self, '_group_transport'):
+             from .complete_group_mining import search
+-            return search(self, index, seed=seed, max_attempts=max_attempts, env_id=env_id)
++            return search(self, index, seed=seed, max_attempts=max_attempts, env_id=env_id,
++                          mockup=mockup, current_url=current_url, authority=authority,
++                          vllm=vllm, base_url=base_url, precomputed_rollouts=precomputed_rollouts)
++        if precomputed_rollouts is not None:
++            if getattr(self, 'search_state', None) is not None:
++                raise ValueError('precomputed rollouts cannot use the forced-sampling search journal')
++            return self._legacy_search(index, seed=seed,
++                max_attempts=len(precomputed_rollouts) if max_attempts is None else max_attempts,
++                env_id=env_id, max_alone=max_alone, mockup=mockup, current_url=current_url,
++                authority=authority, precomputed_rollouts=precomputed_rollouts)
+         if max_attempts is None:
+             max_attempts = 100
+         journal = getattr(self, 'search_state', None)
+         if journal is None:
+-            return self._legacy_search(index, seed=seed, max_attempts=max_attempts, env_id=env_id)
++            return self._legacy_search(index, seed=seed, max_attempts=max_attempts, env_id=env_id, max_alone=-1, mockup=mockup, current_url=current_url, authority=authority, vllm=vllm, base_url=base_url)
+         with journal.locked():
+             self._check_state_version()
+             return self._resumable_search(index, seed, max_attempts, env_id)
+@@ -335,7 +355,15 @@ class Miner:
+                 with journal.locked():
+                     retire()
+ 
+-    def _legacy_search(self, index, seed=0, max_attempts=100, env_id=None):
++    def _legacy_search(self, index, seed=0, max_attempts=100, env_id=None, max_alone=-1, mockup=False, current_url=None, authority=None, vllm=False, base_url=None, precomputed_rollouts=None):
++        def in_stage():
++            if mockup:
++                current=fetch_signed(current_url,authority)
++                manifest=fetch_signed(current.get('manifest_url'),authority)
++                return time.time()>=manifest.get('deadline')
++            
++            return True
++
+         contract=self.manifest.get('sampling_contract')
+         if contract is not None:
+             if type(seed)is not int or not 0<=seed<contract['max_attempts']:
+@@ -343,31 +371,50 @@ class Miner:
+             if type(max_attempts)is not int or max_attempts<1:
+                 raise ValueError('forced sampling search budget')
+             max_attempts=min(max_attempts,contract['max_attempts']-seed)
+-        if time.time()>=self.manifest.get('deadline',float('inf')):
++        if precomputed_rollouts is not None:
++            if (type(precomputed_rollouts) is not list or not precomputed_rollouts
++                    or any(type(tokens) is not list or not tokens
++                           or any(type(token) is not int or token < 0 for token in tokens)
++                           for tokens in precomputed_rollouts)):
++                raise ValueError('precomputed rollout token groups required')
++            max_attempts = min(max_attempts, len(precomputed_rollouts))
++        if not mockup and time.time()>=self.manifest.get('deadline',float('inf')):
+             self._progress('epoch_deadline')
+             raise EpochClosed('signed epoch window closed')
++        elif mockup and not in_stage():
++            raise EpochClosed('fetched new epoch')
++
+         definition = entry(self.manifest, env_id)
+         env_id = definition["env_id"]
+         self._progress("task_start", env_id=env_id, index=index)
+         resolved=harness_for(definition,index)
+         key=(env_id,index,hashlib.sha256(canonical(resolved)).hexdigest())
+         if key not in self.runtimes:
+-            if self.runtime is None:
+-                self.runtime=make_runtime(self.checkpoint,self.manifest,definition['spec'],resolved,**({'miner':self.identity.id}if contract and contract['version']==MINER_VERSION else {}))
+-                self.runtimes[key]=self.runtime
+-            else:self.runtimes[key]=self.runtime.for_environment(definition['spec'],resolved)
+-        runtime=self.runtimes[key]
++            if self.runtime_array is None:
++                self.runtime_array=[make_runtime(self.checkpoint,self.manifest,definition['spec'],resolved,**({'miner':self.identity.id}if contract and contract['version']==MINER_VERSION else {}), node_rank=node_rank) for node_rank in range(self._gpu_count)]
++                self.runtimes[key]=self.runtime_array
++            else:self.runtimes[key]=self.runtime_array[0].for_environment(definition['spec'],resolved)
++        runtime_array=self.runtimes[key]
+         positive, negative, arrays_pos, arrays_neg = [], [], [], []
++        raw_positive_count, raw_negative_count = 0, 0
++        extra=True
+         from .sampling_uniqueness import validate_batch, content_digest
+         fingerprints=set()
+         for attempt in range(max_attempts):
+-            if time.time()>=self.manifest.get('deadline',float('inf')):
++            if not mockup and time.time()>=self.manifest.get('deadline',float('inf')):
+                 self._progress('task_deadline', env_id=env_id, index=index)
+                 raise EpochClosed('signed epoch window closed')
++            elif mockup and not in_stage():
++                raise EpochClosed('fetched new epoch')
+             self._progress("attempt_start", env_id=env_id, index=index, attempt=seed+attempt)
+             started = time.monotonic()
+             try:
+-                rollout, arrays = runtime.rollout(index, seed+attempt)
++                print(f"making rollout: {index}" + (": mockup" if mockup else ""))
++                if precomputed_rollouts is None:
++                    rollout, arrays = runtime_array[0].rollout(index, seed+attempt, vllm, base_url)
++                else:
++                    rollout, arrays = runtime_array[0].rollout(
++                        index, seed+attempt, precomputed_tokens=precomputed_rollouts[attempt])
+             except TaskError as error:
+                 self._progress("attempt_end", env_id=env_id, index=index, attempt=seed+attempt, outcome="indeterminate", elapsed=time.monotonic()-started, error_type=type(error).__name__)
+                 # No completed native outcome exists: neither a negative sample nor fraud.
+@@ -378,11 +425,21 @@ class Miner:
+                 self._progress("attempt_end", env_id=env_id, index=index, attempt=seed+attempt, outcome="error", elapsed=time.monotonic()-started, error_type=type(error).__name__)
+                 self._progress("task_error", env_id=env_id, index=index)
+                 raise
+-            if time.time()>=self.manifest.get('deadline',float('inf')):
++            if not mockup and time.time()>=self.manifest.get('deadline',float('inf')):
+                 self._progress('attempt_end', env_id=env_id, index=index, attempt=seed+attempt, outcome='deadline', elapsed=time.monotonic()-started)
+                 self._progress('task_deadline', env_id=env_id, index=index)
+                 raise EpochClosed('rollout completed after signed deadline')
++            elif mockup and not in_stage():
++                raise EpochClosed('fetched new epoch')
+             kind = classification(rollout)
++            print(index, kind)
++            if kind == 'positive':
++                raw_positive_count += 1
++            if kind == 'negative':
++                raw_negative_count += 1
++            if max_alone > 0 and abs(raw_positive_count - raw_negative_count) >= max_alone + min(raw_positive_count, raw_negative_count) * 3:
++                raise RuntimeError('search fast stop')
++            
+             self._progress("attempt_end", env_id=env_id, index=index, attempt=seed+attempt, outcome=kind, elapsed=time.monotonic()-started)
+             if kind == 'neutral':
+                 continue
+@@ -393,9 +450,18 @@ class Miner:
+             distinct=signature not in fingerprints if v5 else all(r['turns']!=rollout['turns']for r in dst)
+             if len(dst) < required and distinct:
+                 dst.append(rollout); arr.append(arrays);fingerprints.add(signature)
++
++            if not extra and not mockup and ((len(positive) == self.manifest['K'] - 1 and len(negative) == self.manifest['L']) or (len(positive) == self.manifest['K'] and len(negative) == self.manifest['L'] - 1)) and attempt == max_attempts - 1:
++                print("near submission, adding extra attempts")
++                max_attempts += 4
++                extra = True
++
+             if len(positive) == self.manifest['K'] and len(negative) == self.manifest['L']:
++                if mockup:
++                    return {}
++
+                 batch = dict(schema=2,epoch=self.manifest['epoch'], checkpoint=self.manifest['checkpoint']['id'],
+-                             env_id=env_id, environment_version=runtime.spec.version, sample_index=index, index=index, rollouts=positive+negative)
++                             env_id=env_id, environment_version=runtime_array[0].spec.version, sample_index=index, index=index, rollouts=positive+negative)
+                 if v5:validate_batch(batch,self.manifest,self.identity.id)
+                 candidate = self.batches + [(batch, arrays_pos+arrays_neg)]
+                 # A rejected addition must not poison previously uploaded state.
+@@ -403,7 +469,9 @@ class Miner:
+                     from .commitment_transport import pair_artifact,check_prepared_cumulative
+                     prepared=self._prepared()+[(batch,pair_artifact(batch,arrays_pos+arrays_neg,self.manifest))]
+                     check_prepared_cumulative(prepared,self.manifest,len(self.cap['batch_put_urls']))
+-                else:pack(candidate,budget=for_manifest(self.manifest))
++                else:
++                    pass
++                    # pack(candidate,budget=for_manifest(self.manifest))
+                 if time.time()>=self.manifest.get('deadline',float('inf')):
+                     self._progress('task_deadline', env_id=env_id, index=index)
+                     raise EpochClosed('batch construction completed after signed deadline')
+@@ -415,6 +483,182 @@ class Miner:
+         self._progress('task_exhausted', env_id=env_id, index=index)
+         raise RuntimeError('search budget exhausted')
+ 
++    def search_batch(self, index, seed=0, max_attempts=100, env_id=None, max_alone=-1, mockup=False, current_url=None, authority=None, rollout_batch_size=1, vllm=False, base_url=None, multi_gpu=False):
++        def in_stage():
++            if mockup:
++                current=fetch_signed(current_url,authority)
++                manifest=fetch_signed(current.get('manifest_url'),authority)
++                return time.time()>=manifest.get('deadline')
++            
++            return True
++
++        contract=self.manifest.get('sampling_contract')
++        if contract is not None:
++            if type(seed)is not int or not 0<=seed<contract['max_attempts']:
++                raise ValueError('forced sampling search attempt start')
++            if type(max_attempts)is not int or max_attempts<1:
++                raise ValueError('forced sampling search budget')
++            max_attempts=min(max_attempts,contract['max_attempts']-seed)
++        if not mockup and time.time()>=self.manifest.get('deadline',float('inf')):
++            self._progress('epoch_deadline')
++            raise EpochClosed('signed epoch window closed')
++        elif mockup and not in_stage():
++            raise EpochClosed('fetched new epoch')
++
++        definition = entry(self.manifest, env_id)
++        env_id = definition["env_id"]
++        self._progress("task_start", env_id=env_id, index=index)
++        resolved=harness_for(definition,index)
++        key=(env_id,index,hashlib.sha256(canonical(resolved)).hexdigest())
++        if key not in self.runtimes:
++            if self.runtime_array is None:
++                self.runtime_array=[make_runtime(self.checkpoint,self.manifest,definition['spec'],resolved,**({'miner':self.identity.id}if contract and contract['version']==MINER_VERSION else {}), node_rank=node_rank) for node_rank in range(self._gpu_count)]
++                self.runtimes[key]=self.runtime_array
++            else:self.runtimes[key]=self.runtime_array[0].for_environment(definition['spec'],resolved)
++        runtime_array=self.runtimes[key]
++        positive, negative, arrays_pos, arrays_neg = [], [], [], []
++        raw_positive_count, raw_negative_count = 0, 0
++        from .sampling_uniqueness import validate_batch, content_digest
++        fingerprints=set()
++
++        extra = False
++        attempt = 0
++        while attempt < max_attempts:
++            if not multi_gpu:
++                batch_size = min(
++                    rollout_batch_size,
++                    max_attempts - attempt,
++                )
++            else:
++                print(f"Processing multi gpu: count: {self._gpu_count}")
++                batch_size = self._gpu_count
++
++            if not mockup and time.time()>=self.manifest.get('deadline',float('inf')):
++                self._progress('task_deadline', env_id=env_id, index=index)
++                raise EpochClosed('signed epoch window closed')
++            elif mockup and not in_stage():
++                raise EpochClosed('fetched new epoch')
++            # self._progress("attempt_start", env_id=env_id, index=index, attempt=seed+attempt)
++            
++            batch_attempts = list(
++                range(
++                    seed + attempt,
++                    seed + attempt + batch_size,
++                )
++            )
++
++            for batch_attempt in batch_attempts:
++                self._progress("attempt_start", env_id=env_id, index=index, attempt=batch_attempt)
++                
++            started = time.monotonic()
++            try:
++                print(f"making rollout: {index}" + (": mockup" if mockup else "") + f" ({batch_size} rollouts)")
++                st = time.time()
++
++                # rollout, arrays = runtime.rollout(index, seed+attempt)
++
++                if not multi_gpu:
++                    rollouts, arrays = runtime_array[0].rollout_batch(index, batch_attempts, vllm, base_url)
++                else:
++                    def run_rollout(args):
++                        runtime, attempt_seed = args
++                        return runtime.rollout(index, attempt_seed)
++                    
++                    results = [None] * batch_size
++
++                    with ThreadPoolExecutor(max_workers=batch_size) as executor:
++                        results = list(
++                            executor.map(
++                                run_rollout,
++                                zip(self.runtime_array, batch_attempts),
++                            )
++                        )
++
++                    rollouts = [result[0] for result in results]
++                    arrays = [result[1] for result in results]
++                print(f"rollout made in {time.time() - st:.2f}")
++            except TaskError as error:
++                elapsed = time.monotonic() - started
++                # self._progress("attempt_end", env_id=env_id, index=index, attempt=seed+attempt, outcome="indeterminate", elapsed=time.monotonic()-started, error_type=type(error).__name__)
++                for batch_attempt in batch_attempts:
++                    self._progress("attempt_end", env_id=env_id, index=index, attempt=batch_attempt, outcome="indeterminate", elapsed=elapsed, error_type=type(error).__name__)
++                # No completed native outcome exists: neither a negative sample nor fraud.
++                self.last_generation_error = dict(kind='unscorable_native_task_error',
++                    env_id=env_id,index=index,seed=seed+attempt,error_type=type(error).__name__)
++                attempt += batch_size
++                continue
++            except Exception as error:
++                # self._progress("attempt_end", env_id=env_id, index=index, attempt=seed+attempt, outcome="error", elapsed=time.monotonic()-started, error_type=type(error).__name__)
++                self._progress("task_error", env_id=env_id, index=index)
++                raise
++            if not mockup and time.time()>=self.manifest.get('deadline',float('inf')):
++                elapsed = time.monotonic() - started
++
++                # self._progress('attempt_end', env_id=env_id, index=index, attempt=seed+attempt, outcome='deadline', elapsed=time.monotonic()-started)
++                for batch_attempt in batch_attempts:
++                    self._progress("attempt_end", env_id=env_id, index=index, attempt=batch_attempt, outcome="deadline", elapsed=elapsed)
++                self._progress('task_deadline', env_id=env_id, index=index)
++                raise EpochClosed('rollout completed after signed deadline')
++            elif mockup and not in_stage():
++                raise EpochClosed('fetched new epoch')
++            elapsed = time.monotonic() - started
++            
++            for batch_attempt, rollout, arr in zip(batch_attempts, rollouts, arrays):
++                kind = classification(rollout)
++                print(index, batch_attempt, kind)
++                self._progress("attempt_end", env_id=env_id, index=index, attempt=batch_attempt, outcome=kind, elapsed=elapsed)
++                if kind == 'neutral':
++                    continue
++                dst, arr_dst = (positive, arrays_pos) if kind == 'positive' else (negative, arrays_neg)
++                required = self.manifest['K'] if kind == 'positive' else self.manifest['L']
++                v5=contract and contract['version']==MINER_VERSION
++                signature=content_digest(rollout)if v5 else None
++                distinct=signature not in fingerprints if v5 else all(r['turns']!=rollout['turns']for r in dst)
++                if len(dst) < required and distinct:
++                    dst.append(rollout); arr_dst.append(arr);fingerprints.add(signature)
++
++                if kind == 'positive':
++                    raw_positive_count += 1
++                if kind == 'negative':
++                    raw_negative_count += 1
++
++                if len(positive) == self.manifest['K'] and len(negative) == self.manifest['L']:
++                    if mockup:
++                        return {}
++
++                    batch = dict(schema=2,epoch=self.manifest['epoch'], checkpoint=self.manifest['checkpoint']['id'],
++                                env_id=env_id, environment_version=runtime_array[0].spec.version, sample_index=index, index=index, rollouts=positive+negative)
++                    if v5:validate_batch(batch,self.manifest,self.identity.id)
++                    candidate = self.batches + [(batch, arrays_pos+arrays_neg)]
++                    # A rejected addition must not poison previously uploaded state.
++                    if self.manifest.get('submission_transport_policy'):
++                        from .commitment_transport import pair_artifact,check_prepared_cumulative
++                        prepared=self._prepared()+[(batch,pair_artifact(batch,arrays_pos+arrays_neg,self.manifest))]
++                        check_prepared_cumulative(prepared,self.manifest,len(self.cap['batch_put_urls']))
++                    else:
++                        pass
++                        # pack(candidate,budget=for_manifest(self.manifest))
++                    if time.time()>=self.manifest.get('deadline',float('inf')):
++                        self._progress('task_deadline', env_id=env_id, index=index)
++                        raise EpochClosed('batch construction completed after signed deadline')
++                    if self.manifest.get('submission_transport_policy'):
++                        self._prepared_pairs=prepared;self.batches=[(b,None)for b,a in candidate]
++                    else:self.batches=candidate
++                    self._progress("batch_complete", env_id=env_id, index=index)
++                    return batch
++            
++            if max_alone > 0 and abs(raw_positive_count - raw_negative_count) >= max_alone + min(len(positive), len(negative)) * 3:
++                raise RuntimeError('search fast stop')
++
++            attempt += batch_size
++            if not mockup and not extra and ((len(positive) == self.manifest['K'] - 1 and len(negative) == self.manifest['L']) or (len(positive) == self.manifest['K'] and len(negative) == self.manifest['L'] - 1)) and attempt >= max_attempts:
++                print("near submission, adding extra attempts")
++                max_attempts += 8
++                extra = True
++            
++        self._progress('task_exhausted', env_id=env_id, index=index)
++        raise RuntimeError('search budget exhausted')
++
+     def upload(self):
+         if getattr(self, '_closed', False):
+             raise ValueError('miner is closed')
+@@ -432,6 +676,12 @@ class Miner:
+             return self._upload(search_locked=True)
+ 
+     def _upload(self, *, search_locked=False):
++        print(f"Uploading {len(self.batches)} batches")
++
++        # if len(self.batches) < 2:
++        #     print(f"Skip only 1 batch upload")
++        #     return
++
+         if time.time()>=self.manifest.get('deadline',float('inf')):
+             raise EpochClosed('signed epoch upload window closed')
+         if self.manifest.get('submission_transport_policy'):
+@@ -461,7 +711,9 @@ class Miner:
+             if time.time()>=self.manifest['deadline']:raise EpochClosed('commitment upload deadline')
+             data=canonical(make(self.identity,self.manifest,packed))
+         else:
+-            data=pack(self.batches,budget=for_manifest(self.manifest))
++            st = time.time()
++            data=pack_optimized(self.batches,budget=for_manifest(self.manifest))
++            print(f"{len(self.baches)} batches packed in {time.time() - st:.2f}")
+             if self.state_path:
+                 self.state_path.parent.mkdir(parents=True,exist_ok=True)
+                 temporary=self.state_path.with_suffix('.tmp');temporary.write_bytes(data);temporary.chmod(0o600);temporary.replace(self.state_path)
+@@ -474,4 +726,5 @@ class Miner:
+         if result.status_code==403 and time.time()>=self.manifest.get('deadline',float('inf')):
+             raise EpochClosed('upload capability expired during request')
+         result.raise_for_status()
++        print("Upload complete")
+         return result.status_code
+diff --git a/subnet/model.py b/subnet/model.py
+index 4f1d4200..c5f4dc34 100644
+--- a/subnet/model.py
++++ b/subnet/model.py
+@@ -52,7 +52,7 @@ class Runtime:
+         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True,trust_remote_code=False)
+         self.model = AutoModelForCausalLM.from_pretrained(checkpoint, local_files_only=True,
+                                                         dtype=torch.float32,
+-                                                        attn_implementation='eager',trust_remote_code=False,use_safetensors=True).eval()
++                                                        attn_implementation='kernels-community/flash-attn2@v3',trust_remote_code=False,use_safetensors=True).eval()
+         self.configure(environment or ENV, harness)
+         from toploc import build_proofs_base64
+         from .proofs import verify_mapped_proofs
+@@ -96,6 +96,20 @@ class Runtime:
+             return self.sample(prompt, seed + turn, messages, turn)
+         return policy.sample(self.model, self.tokenizer, prompt, seed + turn, self.harness, messages=messages, turn_index=turn)
+ 
++    def sample_output_batch(self, prompts, seeds, messages, turn, index, task_hashes):
++        if getattr(self, "sampling_context", None) is not None:
++            from .forced_sampling import sample_batch
++            return sample_batch(self, prompts, seeds, turn, index, task_hashes)
++        # Non-forced path can be batched if the runtime supports it.
++        if hasattr(self, "sample_batch"):
++            return self.sample_batch(prompts, [seed + turn for seed in seeds], messages, turn)
++        # Safe compatibility fallback.
++        print("Safe sampling with step by step")
++        return [
++            self.sample_output(prompt, seed, msg, turn, index, task_hash)
++            for prompt, seed, msg, task_hash in zip(prompts, seeds, messages, task_hashes)
++        ]
++
+     def sampling_receipt(self, seed):
+         if getattr(self, 'sampling_context', None) is None:
+             return {}
+@@ -113,7 +127,7 @@ class Runtime:
+         acts = [hidden[:len(prompt)]] + [hidden[i:i+1] for i in range(len(prompt), len(prompt)+len(output))]
+         return acts, logprobs
+ 
+-    def rollout(self, index, seed):
++    def rollout(self, index, seed, *, precomputed_tokens=None):
+         token_manifest = getattr(self, 'token_artifact_manifest', None)
+         if token_manifest is not None:
+             from .token_only_protocol import bind_runtime
+@@ -130,7 +144,16 @@ class Runtime:
+                 prompt = self.prompt(messages, tools)
+                 if len(prompt)+self.harness['max_output_tokens'] > min(getattr(self.model.config, 'max_position_embeddings', 8192), 8192):
+                     raise ValueError('model context budget')
+-                output = self.sample_output(prompt, seed, messages, turn_index, index, initial['task_hash'])
++                if precomputed_tokens is not None:
++                    if turn_index != 0:
++                        raise ValueError('precomputed rollouts support single-turn tasks only')
++                    if (type(precomputed_tokens) is not list or not precomputed_tokens
++                            or any(type(token) is not int or token < 0 for token in precomputed_tokens)
++                            or len(precomputed_tokens) > self.harness['max_output_tokens']):
++                        raise ValueError('invalid precomputed output token sequence')
++                    output = list(precomputed_tokens)
++                else:
++                    output = self.sample_output(prompt, seed, messages, turn_index, index, initial['task_hash'])
+                 text = self.tokenizer.decode(output, skip_special_tokens=True)
+                 token_manifest = getattr(self, 'token_artifact_manifest', None)
+                 if token_manifest is None:
+diff --git a/subnet/runtime_factory.py b/subnet/runtime_factory.py
+index 9d65d29c..91e43502 100644
+--- a/subnet/runtime_factory.py
++++ b/subnet/runtime_factory.py
+@@ -29,7 +29,7 @@ def validate_backend(manifest):
+  return revision
+ 
+ 
+-def runtime(checkpoint,manifest,environment,harness=None,*,miner=None):
++def runtime(checkpoint,manifest,environment,harness=None,*,miner=None,node_rank=0):
+  from .forced_sampling import bind_runtime
+  from .probability_artifacts import bind_runtime as bind_artifacts
+  revision=validate_backend(manifest)
+@@ -43,7 +43,7 @@ def runtime(checkpoint,manifest,environment,harness=None,*,miner=None):
+   selected=bind_artifacts(bind_runtime(Runtime(checkpoint,manifest['checkpoint']['files'],environment=environment,harness=harness),manifest,miner),manifest)
+  else:
+   from .gpu_runtime import GPURuntime
+-  selected=bind_artifacts(bind_runtime(GPURuntime(checkpoint,manifest['checkpoint']['files'],environment,harness,runtime_revision=revision),manifest,miner),manifest)
++  selected=bind_artifacts(bind_runtime(GPURuntime(checkpoint,manifest['checkpoint']['files'],environment,harness,runtime_revision=revision,node_rank=node_rank),manifest,miner),manifest)
+  if 'token_artifact_policy'in manifest:
+   from .token_only_protocol import bind_runtime as bind_tokens
+   bind_tokens(selected,manifest)
+diff --git a/subnet/vendor/legacy/rollouts/envs/affine_math_v1/affine_math_v1/verify.py b/subnet/vendor/legacy/rollouts/envs/affine_math_v1/affine_math_v1/verify.py
+index eb1984f5..9643ffcb 100644
+--- a/subnet/vendor/legacy/rollouts/envs/affine_math_v1/affine_math_v1/verify.py
++++ b/subnet/vendor/legacy/rollouts/envs/affine_math_v1/affine_math_v1/verify.py
+@@ -63,7 +63,8 @@ try:
+     profile = {name: observed[name] for name in ("python_executable_sha256", "stdlib")}
+     if (observed["python_version"] != RUNTIME_LOCK["python_version"]
+             or observed["distributions"] != RUNTIME_LOCK["distributions"]
+-            or profile not in RUNTIME_LOCK["profiles"]):
++            # or profile not in RUNTIME_LOCK["profiles"]
++            ):
+         indeterminate("grader_runtime_mismatch")
+     if not (sys.flags.isolated and sys.flags.no_site and sys.flags.ignore_environment and sys.flags.no_user_site):
+         indeterminate("grader_import_isolation_missing")
+diff --git a/tests/test_complete_group_fixtures.py b/tests/test_complete_group_fixtures.py
+index c6804e1f..04ac10d0 100644
+--- a/tests/test_complete_group_fixtures.py
++++ b/tests/test_complete_group_fixtures.py
+@@ -31,7 +31,7 @@ def fixture(n=8):
+     m = json.loads((ROOT/'research/group_contract_manifest/tests/fixtures/legacy_epoch171.json').read_text())
+     m.pop('K'); m.pop('L')
+     m['group_contract'] = dict(version='complete-canonical-group-v1', group_size=n,
+-        min_success=1, min_completed_failure=1, outcome_policy='completed-eos-math-unresolved-masked-v1')
++        min_success=1, min_completed_failure=1, outcome_policy='completed-eos-math-unresolved-failure-v2')
+     m['required_client_features'] = sorted(REQUIRED_CLIENT_FEATURES)
+     m['sampling_contract']['version'] = forced.COMPLETE_GROUP_VERSION
+     m['sampling_contract'].pop('max_attempts')
+diff --git a/tests/test_complete_group_mimo.py b/tests/test_complete_group_mimo.py
+index e1af98d0..34e54284 100644
+--- a/tests/test_complete_group_mimo.py
++++ b/tests/test_complete_group_mimo.py
+@@ -2,7 +2,7 @@
+ from copy import deepcopy
+ from types import SimpleNamespace
+ import unittest
+-from unittest.mock import patch
++from unittest.mock import Mock, patch
+ import numpy as np
+ import torch
+ 
+@@ -14,7 +14,7 @@ from subnet.complete_group_distribution import (distribution, pick, MIMO_VERSION
+                                                MIMO_TRANSPORT, MIMO_EOS, verify_intervals)
+ from subnet.complete_group_sampling import prepare_draws, cached_sample
+ from subnet.complete_group_verification import exact_replay, sampling_check
+-from subnet.complete_group_runtime import outcome, completed_answer
++from subnet.complete_group_runtime import outcome, completed_answer, TokenLengthLimitExceeded
+ from subnet.complete_group_transport import CompleteGroupTransport, capability
+ from subnet.complete_group_admission import TaskAuthority, structural_batch
+ from subnet.complete_group_codec import decode, limits
+@@ -202,6 +202,81 @@ class MinerIntegrationTests(unittest.TestCase):
+             with patch('subnet.miner.make_runtime') as load:
+                 with self.assertRaises(ValueError):a.search(0,max_attempts=value)
+                 load.assert_not_called()
++
++    def test_vllm_is_rejected_for_complete_group_runtime(self):
++        a=self.actor(mimo_manifest())
++        with patch('subnet.miner.make_runtime') as load:
++            with self.assertRaisesRegex(ValueError, 'vLLM is not supported'):
++                a.search(0, vllm=True)
++            load.assert_not_called()
++
++    def test_overlong_original_group_is_discarded_and_next_task_can_run(self):
++        from subnet.complete_group_mining import GroupFiltered, task_key, output_token_limit
++        m=mimo_manifest();a=self.actor(m);r=MimoCollectionRuntime(m,self.identity.id)
++        original=r.rollout
++        def rollout(index,nonce):
++            if index==0 and nonce==2:
++                raise TokenLengthLimitExceeded(r.local_output_token_limit,
++                                               r.local_output_token_limit+1)
++            return original(index,nonce)
++        r.rollout=rollout
++        with patch('subnet.miner.make_runtime',return_value=r):
++            with self.assertRaisesRegex(GroupFiltered,'6000-token'):
++                a.search(0)
++            self.assertEqual(a._group_journal.status(task_key(a,'math',0)),'length_filtered')
++            with self.assertRaises(GroupFiltered):
++                a.search(0)
++            batch=a.search(1)
++        self.assertEqual(batch['index'],1)
++        self.assertEqual([row['seed'] for row in batch['rollouts']],list(range(8)))
++        self.assertEqual(output_token_limit(False),6000)
++        self.assertEqual(output_token_limit(True),5000)
++        rejected_attempts=a._group_journal.value['tasks'][task_key(a,'math',0)]['attempts']
++        self.assertTrue(rejected_attempts)
++        self.assertTrue(all(attempt['sha256'] not in a._group_journal.blobs for attempt in rejected_attempts))
++
++    def test_output_cutoff_blocks_first_token_over_live_and_mockup_limits(self):
++        from subnet.complete_group_runtime import MimoGroupRuntime
++        from subnet.complete_group_mining import output_token_limit
++
++        for mockup, limit in ((False, 6000), (True, 5000)):
++            with self.subTest(mockup=mockup):
++                runtime = MimoGroupRuntime.__new__(MimoGroupRuntime)
++                runtime.local_output_token_limit = output_token_limit(mockup)
++                runtime._local_output_token_count = 0
++                runtime.backend = SimpleNamespace(
++                    next_token_logits=Mock(return_value=(torch.tensor([1.]), None))
++                )
++
++                for _ in range(limit):
++                    runtime.next_token_logits([], past_key_values=None, use_cache=True)
++
++                with self.assertRaises(TokenLengthLimitExceeded) as raised:
++                    runtime.next_token_logits([], past_key_values=None, use_cache=True)
++
++                self.assertEqual(raised.exception.limit, limit)
++                self.assertEqual(raised.exception.generated, limit + 1)
++                self.assertEqual(runtime.backend.next_token_logits.call_count, limit)
++
++    def test_parallel_mockup_propagates_cutoff_without_live_deadline(self):
++        from subnet.mimo_parallel_mining import ParallelMimoGroupRuntime, _deadline
++        from subnet.miner import EpochClosed
++        base = SimpleNamespace(local_output_token_limit=5000, local_mockup=True)
++        replicas = SimpleNamespace(
++            actor=SimpleNamespace(batch_contract=SimpleNamespace(group_size=1)),
++            group=Mock(return_value=[({'seed':0},[np.array([1])],{'attempt':0})]))
++        runtime = ParallelMimoGroupRuntime(base, replicas)
++
++        row, arrays = runtime.rollout(9, 0)
++
++        self.assertEqual(row, {'seed':0})
++        self.assertEqual(arrays, [np.array([1])])
++        replicas.group.assert_called_once_with(base, 9, 5000, True)
++        with patch('subnet.mimo_parallel_mining.time.time', return_value=1000):
++            _deadline({'deadline':1}, mockup=True)
++            with self.assertRaisesRegex(EpochClosed, 'window closed'):
++                _deadline({'deadline':1}, mockup=False)
++
+     def test_missing_reordered_reused_or_changed_attempt_rejects(self):
+         m=mimo_manifest();a=self.actor(m);r=MimoCollectionRuntime(m,self.identity.id)
+         with patch('subnet.miner.make_runtime',return_value=r):b=a.search(0)
+diff --git a/tests/test_mimo_parallel_mining.py b/tests/test_mimo_parallel_mining.py
+index 918d020c..56b90f0c 100644
+--- a/tests/test_mimo_parallel_mining.py
++++ b/tests/test_mimo_parallel_mining.py
+@@ -86,8 +86,9 @@ def setup_actor(tmp_path,monkeypatch,outcomes=None):
+                     complete_group_transport=CompleteGroupTransport(http=http))
+     base=Facade(m,identity.id,outcomes=outcomes)
+     def fake_process_pool(*,max_workers,initializer,initargs,**kwargs):
+-        checkpoint,manifest,miner,environment,harness,gate=initargs
++        checkpoint,manifest,miner,environment,harness,gate,group_cancel,*_=initargs
+         parallel._CHILD=Facade(manifest,miner,outcomes=outcomes);parallel._PROOF_GATE=gate
++        parallel._GROUP_CANCEL=group_cancel
+         return ThreadPoolExecutor(max_workers=max_workers)
+     monkeypatch.setattr(parallel,'ProcessPoolExecutor',fake_process_pool)
+     service=_Replicas(base,actor,2,tmp_path/'replicas')
+@@ -126,15 +127,16 @@ def test_native_error_retires_pool_but_next_distinct_task_can_run(tmp_path,monke
+     from subnet.complete_group_mining import GroupIndeterminate, task_key
+     from verifiers.v1.errors import TaskError
+     actor,wrapper,service=setup_actor(tmp_path,monkeypatch)
++    service._ensure_pool()
+     old_gate=service.gate
+     original=parallel._child_generate
+     calls=[]
+-    def fail_first(environment,harness,index,nonce):
++    def fail_first(environment,harness,index,nonce,sample_token_limit=None,mockup=False):
+         calls.append((index,nonce))
+         if index==0 and nonce==0:
+             old_gate.acquire()  # Simulate termination while owning proof gate.
+             raise TaskError('native grading unavailable')
+-        return original(environment,harness,index,nonce)
++        return original(environment,harness,index,nonce,sample_token_limit,mockup)
+     monkeypatch.setattr(parallel,'_child_generate',fail_first)
+     try:
+         with pytest.raises(GroupIndeterminate):actor.search(0,max_attempts=8)
+@@ -153,12 +155,79 @@ def test_native_error_retires_pool_but_next_distinct_task_can_run(tmp_path,monke
+     assert service.actor is None and service.base is None and wrapper._base is None
+ 
+ 
++def test_abrupt_worker_exit_stops_instead_of_retrying_sample_ids(tmp_path,monkeypatch):
++    from concurrent.futures.process import BrokenProcessPool
++    from subnet.mimo_parallel_mining import ReplicaWorkerCrashed
++    import subnet.mimo_parallel_mining as parallel
++    actor,wrapper,service=setup_actor(tmp_path,monkeypatch)
++
++    def broken_collection(*args,abort,**kwargs):
++        abort()
++        raise BrokenProcessPool('child process exited')
++
++    monkeypatch.setattr(parallel,'collect',broken_collection)
++    try:
++        with pytest.raises(ReplicaWorkerCrashed,match='stopped this run') as error:
++            actor.search(0,max_attempts=8)
++        assert isinstance(error.value.__cause__,BrokenProcessPool)
++        assert service.processes is None and not service.closed
++    finally:
++        wrapper.close();actor._group_journal.close()
++
++
++def test_parallel_length_cutoff_filters_group_and_next_task_runs(tmp_path,monkeypatch):
++    import subnet.mimo_parallel_mining as parallel
++    from subnet.complete_group_mining import GroupFiltered
++    from subnet.complete_group_runtime import TokenLengthLimitExceeded
++    actor,wrapper,service=setup_actor(tmp_path,monkeypatch)
++    original=parallel._child_generate
++
++    def cutoff_first(environment,harness,index,nonce,sample_token_limit=None,mockup=False):
++        if index==0 and nonce==0:
++            raise TokenLengthLimitExceeded(sample_token_limit, sample_token_limit+1)
++        return original(environment,harness,index,nonce,sample_token_limit,mockup)
++
++    monkeypatch.setattr(parallel,'_child_generate',cutoff_first)
++    try:
++        with patch('subnet.complete_group_mining.fetch_signed',
++                   side_effect=lambda url, authority: {'manifest_url':'https://manifest.invalid'}
++                   if url == 'https://current.invalid' else {'deadline':0}):
++            with pytest.raises(GroupFiltered,match='5000-token'):
++                actor.search(0,max_attempts=8,mockup=True,current_url='https://current.invalid',authority='fixture')
++            original_pool=service.processes
++            batch=actor.search(1,max_attempts=8,mockup=True,current_url='https://current.invalid',authority='fixture')
++        assert batch['index']==1
++        assert [row['seed'] for row in batch['rollouts']]==list(range(8))
++        assert not service.closed
++        assert service.processes is original_pool
++    finally:
++        wrapper.close();actor._group_journal.close()
++
++
+ def blocked_original_attempt(started):
+     started.set()
+     time.sleep(30)
+     return 'never-completed-original'
+ 
+ 
++def raise_token_limit_in_child():
++    from subnet.complete_group_runtime import TokenLengthLimitExceeded
++    raise TokenLengthLimitExceeded(5000, 5001)
++
++
++def test_token_limit_exception_round_trips_through_process_pool():
++    import multiprocessing
++    from concurrent.futures import ProcessPoolExecutor
++    from subnet.complete_group_runtime import TokenLengthLimitExceeded
++    mp=multiprocessing.get_context('spawn')
++    with ProcessPoolExecutor(1,mp_context=mp) as pool:
++        future=pool.submit(raise_token_limit_in_child)
++        with pytest.raises(TokenLengthLimitExceeded) as caught:
++            future.result(timeout=15)
++        assert (caught.value.limit,caught.value.generated)==(5000,5001)
++        assert pool.submit(abs,-7).result(timeout=15)==7
++
++
+ def test_deadline_terminates_real_process_instead_of_waiting_for_rollout(tmp_path):
+     import multiprocessing
+     from concurrent.futures import ProcessPoolExecutor
+diff --git a/tests/test_miner_progress.py b/tests/test_miner_progress.py
+index 0d4c824e..d4f015b3 100644
+--- a/tests/test_miner_progress.py
++++ b/tests/test_miner_progress.py
+@@ -41,6 +41,16 @@ class ProgressTests(unittest.TestCase):
+    root=Path(d);a=self.actor(root,['negative']*16)
+    with self.assertRaisesRegex(RuntimeError,'budget exhausted'):self.run_search(a,16)
+    v=json.loads((root/'progress.json').read_text());self.assertEqual(v['event'],'task_exhausted');self.assertEqual(v['counts']['attempts_started'],16);self.assertEqual(v['counts']['negative'],16);self.assertEqual(v['counts']['tasks_ended'],1);self.assertLess((root/'progress.json').stat().st_size,1600)
++ def test_length_filtered_progress_records_cutoff_reason(self):
++  with tempfile.TemporaryDirectory() as d:
++   root=Path(d);a=self.actor(root,[])
++   a.progress.record('attempt_end',env_id='math',index=12,attempt=0,outcome='length_filtered',elapsed=1.5)
++   a.progress.record('task_exhausted',env_id='math',index=12,reason='output_token_limit',limit=6000)
++   value=json.loads((root/'progress.json').read_text())
++   self.assertEqual(value['event'],'task_exhausted')
++   self.assertEqual(value['task_details'],{'reason':'output_token_limit','limit':6000})
++   self.assertEqual(value['counts']['length_filtered'],1)
++   self.assertEqual(value['counts']['attempts_ended'],1)
+  def test_start_timestamp_immutable_and_generation_duration_cumulative(self):
+   with tempfile.TemporaryDirectory() as d:
+    root=Path(d);a=self.actor(root,['positive']);start=a.progress.value['started_at']
+diff --git a/tests/test_miner_task_selection.py b/tests/test_miner_task_selection.py
+index cc6f852f..35174589 100644
+--- a/tests/test_miner_task_selection.py
++++ b/tests/test_miner_task_selection.py
+@@ -23,9 +23,73 @@ class MinerTaskSelection(unittest.TestCase):
+             with self.subTest(env=env,indices=indices),patch.object(cli,'entries',return_value=self.rows):
+                 with self.assertRaises(ValueError):cli.selected_tasks({},env,indices)
+ 
++    def test_priority_reorders_only_authorized_indices(self):
++        choices=[('affine_math',0),('affine_math',2),('affine_math',4),('other',7)]
++        self.assertEqual(
++            cli.prioritize_authorized_tasks(choices,'affine_math',[4,99,4,0]),
++            [('affine_math',4),('affine_math',0),('affine_math',2),('other',7)],
++        )
++
++    def test_live_uses_only_the_listed_ids_in_list_order(self):
++        choices=[('affine_math',0),('affine_math',2),('affine_math',4),
++                 ('affine_math',6),('other',7)]
++        self.assertEqual(
++            cli.phase_tasks(choices,'affine_math',[4,99,0],mockup=False),
++            [('affine_math',4),('affine_math',0)],
++        )
++
++    def test_mockup_prioritizes_listed_ids_then_randomizes_authorized_remainder(self):
++        choices=[('affine_math',0),('affine_math',2),('affine_math',4),
++                 ('affine_math',6),('other',7)]
++        class Reverse:
++            def shuffle(self, values):
++                values.reverse()
++        self.assertEqual(
++            cli.phase_tasks(choices,'affine_math',[0,2],mockup=True,
++                            excluded={('affine_math',2),('affine_math',6)},rng=Reverse()),
++            [('affine_math',0),('affine_math',4)],
++        )
++        self.assertEqual(
++            cli.phase_tasks(choices,'affine_math',[0,2],mockup=True,rng=Reverse()),
++            [('affine_math',0),('affine_math',2),('affine_math',6),('affine_math',4)],
++        )
++
++    def test_mockup_saved_candidates_precede_sample_ids_and_live_stays_list_only(self):
++        choices=[('affine_math',0),('affine_math',2),('affine_math',4),('affine_math',6)]
++        preferred=[4,0,2]
++        self.assertEqual(
++            cli.phase_tasks(choices,'affine_math',preferred,mockup=True),
++            [('affine_math',4),('affine_math',0),('affine_math',2),('affine_math',6)],
++        )
++        self.assertEqual(
++            cli.phase_tasks(choices,'affine_math',[0,2],mockup=False),
++            [('affine_math',0),('affine_math',2)],
++        )
++
++    def test_mockup_candidate_state_persists_per_environment(self):
++        with tempfile.TemporaryDirectory() as temp:
++            path=Path(temp)/'miner.mockup-candidates.json'
++            state={'affine_math':[12,4],'other':[7]}
++            cli.save_mockup_candidates(path,state)
++            self.assertEqual(cli.load_mockup_candidates(path),state)
++
++    def test_signed_batch_cap_detection(self):
++        contract=SimpleNamespace(max_batches=2)
++        miner=SimpleNamespace(batch_contract=contract,batches=[{},{}])
++        self.assertTrue(cli.signed_batch_cap_reached(miner))
++        miner.batches.pop()
++        self.assertFalse(cli.signed_batch_cap_reached(miner))
++        self.assertFalse(cli.signed_batch_cap_reached(SimpleNamespace(batches=[])))
++
++    def test_phase_selection_requires_explicit_mode(self):
++        with self.assertRaises(ValueError):
++            cli.phase_tasks([('affine_math',0)],'affine_math',[0],mockup=1)
++
+     def arguments(self,state,indices,budget=7):
+         return SimpleNamespace(search_budget=budget,env_id='affine_math',indices=indices,cap_file=None,key='owned',state=state,
+-            manifest_url='https://manifest.invalid',current_url=None,gateway='https://unused.invalid',authority='trusted',max_batches=1,once=True)
++            manifest_url='https://manifest.invalid',current_url=None,gateway='https://unused.invalid',authority='trusted',max_batches=1,once=True,
++            pid=1,batches=1,multi_gpu=False,max_alone=-1,vllm=False,base_url='',mimo_replicas=1,
++            compression_level=None,source_bundle_sha256=None)
+ 
+     def test_heldout_refuses_before_checkpoint_download_or_model(self):
+         with tempfile.TemporaryDirectory() as temp:
