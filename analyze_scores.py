@@ -19,6 +19,6 @@ with open(file_path, "w", encoding="utf-8") as f:
         f.write(f"{record}\n")
 
 for miner in positive_miners:
-    print(f'Uid: {miner["uid"]}, Hotkey: {miner["hotkey"]}, share_now: {miner["share_now"]}, flip_score: {miner.get("flip_score", "N/A")}, n_fail_to_pass: {miner.get("n_fail_to_pass", "N/A")}, n_pass_to_fail: {miner.get("n_pass_to_fail", "N/A")}')
+    print(f'UID: {miner["uid"]}, Hotkey: {miner["hotkey"]}, share_now: {miner["share_now"]}, flip_score: {miner.get("flip_score", "N/A")}, n_fail_to_pass: {miner.get("n_fail_to_pass", "N/A")}, n_pass_to_fail: {miner.get("n_pass_to_fail", "N/A")}')
 
 print(f"\nTotal miners with flip_score > 0 and share_now == 0: {len(positive_miners)}")
