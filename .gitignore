@@ -16,6 +16,7 @@ wallets/
 deploy/
 docs/
 dataset/
+results/
 experiments/
 evidence/system-panel/*
 !evidence/system-panel/README.md
